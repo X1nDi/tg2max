@@ -1,6 +1,7 @@
 ﻿import asyncio
 import contextlib
 import ast
+import hashlib
 import html
 import json
 import logging
@@ -8,6 +9,7 @@ import os
 import re
 import secrets
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -56,13 +58,66 @@ try:
 except Exception:
     UPDATE_POLL_SECONDS = 10
 
+try:
+    CHAT_AUTORELOAD_SECONDS = max(
+        3,
+        min(5, int(os.getenv("CHAT_AUTORELOAD_SECONDS", "4").strip())),
+    )
+except Exception:
+    CHAT_AUTORELOAD_SECONDS = 4
+
+try:
+    QUEUE_RETRY_SECONDS = max(3, int(os.getenv("QUEUE_RETRY_SECONDS", "5").strip()))
+except Exception:
+    QUEUE_RETRY_SECONDS = 5
+
+try:
+    QUEUE_BATCH_SIZE = max(1, int(os.getenv("QUEUE_BATCH_SIZE", "20").strip()))
+except Exception:
+    QUEUE_BATCH_SIZE = 20
+
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
+OUTBOX_DIR = os.path.join("sessions", "outbox")
+TEMPORARY_SEND_ERROR_MARKERS = (
+    "timeout",
+    "timed out",
+    "temporarily",
+    "temporary",
+    "connect",
+    "connection",
+    "network",
+    "unavailable",
+    "service unavailable",
+    "502",
+    "503",
+    "504",
+    "send and wait failed",
+    "broken pipe",
+    "connection reset",
+    "socket",
+    "websocket",
+    "transport",
+)
+PERMANENT_SEND_ERROR_MARKERS = (
+    "invalid token",
+    "login.token",
+    "not found",
+    "forbidden",
+    "permission denied",
+    "auth",
+    "unauthorized",
+)
 
 HISTORY_ANCHORS: dict[tuple[int, int], int] = {}
 CHAT_CACHE: dict[int, tuple[float, list["ChatEntry"]]] = {}
 MEDIA_CACHE: dict[str, "MediaRequest"] = {}
 UPDATE_LAST_SEEN: dict[tuple[int, int], int] = {}
+UNREAD_COUNTS: dict[tuple[int, int], int] = {}
+ACTIVE_CHAT_VIEWS: dict[int, "ActiveChatView"] = {}
 UPDATE_TASK: asyncio.Task | None = None
+CHAT_REFRESH_TASK: asyncio.Task | None = None
+QUEUE_TASK: asyncio.Task | None = None
 
 bot = Bot(
     token=BOT_TOKEN,
@@ -99,6 +154,45 @@ class MediaRequest:
     created_at: float = field(default_factory=time.time)
 
 
+@dataclass
+class ActiveChatView:
+    tg_user_id: int
+    tg_chat_id: int
+    tg_message_id: int
+    chat_id: int
+    chat_page: int
+    offset: int = 0
+    paused: bool = False
+    signature: str = ""
+    last_refresh_at: float = 0.0
+    in_progress: bool = False
+
+
+@dataclass
+class SendErrorEvent:
+    at: int
+    source: str
+    tg_user_id: int
+    chat_id: int
+    error: str
+
+
+@dataclass
+class RuntimeMetrics:
+    started_at: float = field(default_factory=time.time)
+    direct_sent: int = 0
+    queued_messages: int = 0
+    queue_sent: int = 0
+    send_failures: int = 0
+    update_notifications: int = 0
+    latencies_ms: deque[float] = field(default_factory=lambda: deque(maxlen=400))
+    send_errors: deque[SendErrorEvent] = field(default_factory=lambda: deque(maxlen=40))
+
+
+METRICS = RuntimeMetrics()
+ADMIN_IDS: set[int] = set()
+
+
 def esc(value: Any) -> str:
     return html.escape(str(value) if value is not None else "")
 
@@ -112,6 +206,143 @@ def parse_int(raw: str, default: int = 0) -> int:
         return int(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_admin_ids(raw: str) -> set[int]:
+    result: set[int] = set()
+    for chunk in re.split(r"[\s,;]+", (raw or "").strip()):
+        if not chunk:
+            continue
+        user_id = parse_int(chunk, default=0)
+        if user_id > 0:
+            result.add(user_id)
+    return result
+
+
+ADMIN_IDS = _parse_admin_ids(ADMIN_IDS_RAW)
+if ADMIN_IDS:
+    logger.info("Admin commands enabled for %s user(s)", len(ADMIN_IDS))
+else:
+    logger.warning("ADMIN_IDS is empty: /health and /stats will be available for all users")
+
+
+def is_admin_user(user_id: int) -> bool:
+    if not ADMIN_IDS:
+        return True
+    return user_id in ADMIN_IDS
+
+
+def format_duration(seconds: int) -> str:
+    total = max(0, int(seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def percentile(values: list[float], ratio: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = int(round((len(ordered) - 1) * ratio))
+    idx = max(0, min(len(ordered) - 1, idx))
+    return float(ordered[idx])
+
+
+def record_send_latency(latency_ms: float) -> None:
+    METRICS.latencies_ms.append(max(0.0, float(latency_ms)))
+
+
+def record_send_error(source: str, tg_user_id: int, chat_id: int, exc: Exception) -> None:
+    METRICS.send_failures += 1
+    message = str(exc).strip().replace("\n", " ")
+    if len(message) > 300:
+        message = message[:297] + "..."
+    METRICS.send_errors.append(
+        SendErrorEvent(
+            at=int(time.time()),
+            source=source,
+            tg_user_id=tg_user_id,
+            chat_id=chat_id,
+            error=message,
+        )
+    )
+
+
+def unread_count_for_chat(tg_user_id: int, chat_id: int) -> int:
+    return max(0, int(UNREAD_COUNTS.get((tg_user_id, chat_id), 0)))
+
+
+def total_unread_for_user(tg_user_id: int) -> int:
+    return sum(count for (uid, _), count in UNREAD_COUNTS.items() if uid == tg_user_id)
+
+
+def mark_chat_read(tg_user_id: int, chat_id: int, seen_time: int | None = None) -> None:
+    key = (tg_user_id, chat_id)
+    mark = int(seen_time or now_ms())
+    UPDATE_LAST_SEEN[key] = max(UPDATE_LAST_SEEN.get(key, 0), mark)
+    UNREAD_COUNTS.pop(key, None)
+
+
+def increment_unread_count(tg_user_id: int, chat_id: int, delta: int) -> None:
+    if delta <= 0:
+        return
+    key = (tg_user_id, chat_id)
+    UNREAD_COUNTS[key] = max(0, int(UNREAD_COUNTS.get(key, 0)) + int(delta))
+
+
+def clear_all_unread_for_user(tg_user_id: int) -> int:
+    keys = [key for key in UNREAD_COUNTS if key[0] == tg_user_id]
+    cleared = sum(int(UNREAD_COUNTS.get(key, 0)) for key in keys)
+    for key in keys:
+        UNREAD_COUNTS.pop(key, None)
+    return cleared
+
+
+def set_active_chat_view(
+    tg_user_id: int,
+    tg_chat_id: int,
+    tg_message_id: int,
+    chat_id: int,
+    chat_page: int,
+    offset: int,
+    signature: str,
+    paused: bool = False,
+) -> None:
+    ACTIVE_CHAT_VIEWS[tg_user_id] = ActiveChatView(
+        tg_user_id=tg_user_id,
+        tg_chat_id=tg_chat_id,
+        tg_message_id=tg_message_id,
+        chat_id=chat_id,
+        chat_page=chat_page,
+        offset=offset,
+        paused=paused,
+        signature=signature,
+        last_refresh_at=time.time(),
+    )
+
+
+def clear_active_chat_view(tg_user_id: int) -> None:
+    ACTIVE_CHAT_VIEWS.pop(tg_user_id, None)
+
+
+def chat_view_signature(text: str, reply_markup: InlineKeyboardMarkup | None) -> str:
+    payload = text
+    if reply_markup is not None:
+        try:
+            payload += "\n" + json.dumps(reply_markup.model_dump(), ensure_ascii=True, sort_keys=True)
+        except Exception:
+            payload += "\n" + str(reply_markup)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def is_temporary_send_error(exc: Exception) -> bool:
+    lowered = str(exc).lower()
+    if any(marker in lowered for marker in PERMANENT_SEND_ERROR_MARKERS):
+        return False
+    return any(marker in lowered for marker in TEMPORARY_SEND_ERROR_MARKERS)
 
 
 def normalize_token_input(raw: str) -> str | None:
@@ -316,6 +547,62 @@ async def build_max_attachment_from_message(
         return MaxFile(path=path), path
 
     return None, None
+
+
+def outgoing_attachment_kind(attachment: MaxPhoto | MaxVideo | MaxFile | None) -> str | None:
+    if attachment is None:
+        return None
+    if isinstance(attachment, MaxPhoto):
+        return "PHOTO"
+    if isinstance(attachment, MaxVideo):
+        return "VIDEO"
+    return "FILE"
+
+
+def persist_outgoing_attachment(
+    tg_user_id: int,
+    temp_path: str,
+    source_name: str | None = None,
+) -> str:
+    if not temp_path or not os.path.isfile(temp_path):
+        raise ValueError("Не найден временный файл вложения для очереди отправки")
+
+    user_dir = os.path.join(OUTBOX_DIR, f"user_{tg_user_id}")
+    os.makedirs(user_dir, exist_ok=True)
+    file_name = os.path.basename(source_name or temp_path or "attachment.bin")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file_name).strip("._") or "attachment.bin"
+    destination = os.path.join(
+        user_dir,
+        f"{int(time.time())}_{secrets.token_hex(4)}_{safe_name}",
+    )
+    os.replace(temp_path, destination)
+    return destination
+
+
+def build_outgoing_attachment_from_queue(
+    item: dict[str, Any],
+) -> MaxPhoto | MaxVideo | MaxFile | None:
+    attachment_path = str(item.get("attachment_path") or "").strip()
+    if not attachment_path:
+        return None
+    if not os.path.isfile(attachment_path):
+        raise FileNotFoundError(f"Файл вложения не найден: {attachment_path}")
+
+    kind = str(item.get("attachment_type") or "").upper()
+    if kind == "PHOTO":
+        return MaxPhoto(path=attachment_path)
+    if kind == "VIDEO":
+        return MaxVideo(path=attachment_path)
+    return MaxFile(path=attachment_path)
+
+
+def queued_message_keyboard(chat_id: int, chat_page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="↩️ Открыть чат", callback_data=f"chat:{chat_id}:0:{chat_page}")],
+            [InlineKeyboardButton(text="⬅️ Назад к чатам", callback_data=f"chats:{chat_page}")],
+        ]
+    )
 
 
 def normalize_chat_type(chat_type: Any) -> str:
@@ -617,15 +904,23 @@ def build_members_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows), page, total_pages
 
 
-def build_chats_keyboard(entries: list[ChatEntry], page: int) -> tuple[InlineKeyboardMarkup, int, int]:
+def build_chats_keyboard(
+    entries: list[ChatEntry],
+    page: int,
+    tg_user_id: int,
+) -> tuple[InlineKeyboardMarkup, int, int]:
     total_pages = max(1, (len(entries) + CHAT_PAGE_SIZE - 1) // CHAT_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     start = page * CHAT_PAGE_SIZE
     page_items = entries[start : start + CHAT_PAGE_SIZE]
 
     rows: list[list[InlineKeyboardButton]] = []
+    unread_total = total_unread_for_user(tg_user_id)
     for item in page_items:
         label = f"{chat_type_icon(item.chat_type)} {short_title(item.title)}"
+        unread_count = unread_count_for_chat(tg_user_id, item.chat_id)
+        if unread_count > 0:
+            label = f"{label} • {unread_count}"
         rows.append(
             [
                 InlineKeyboardButton(
@@ -643,6 +938,16 @@ def build_chats_keyboard(entries: list[ChatEntry], page: int) -> tuple[InlineKey
     if nav:
         rows.append(nav)
 
+    if unread_total > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"✅ Прочитать все ({unread_total})",
+                    callback_data=f"readall:{page}",
+                )
+            ]
+        )
+
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows), page, total_pages
 
@@ -656,6 +961,7 @@ def build_history_keyboard(
     page_step: int,
     show_members: bool,
     profile_user_id: int | None,
+    auto_refresh_paused: bool,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     step = max(1, page_step)
@@ -693,6 +999,20 @@ def build_history_keyboard(
                 InlineKeyboardButton(
                     text="👤 Профиль",
                     callback_data=f"profile:{chat_id}:{offset}:{chat_page}:{profile_user_id}",
+                )
+            ]
+        )
+
+    if offset == 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="▶️ Продолжить" if auto_refresh_paused else "⏸ Пауза",
+                    callback_data=(
+                        f"chatauto:resume:{chat_id}:{chat_page}"
+                        if auto_refresh_paused
+                        else f"chatauto:pause:{chat_id}:{chat_page}"
+                    ),
                 )
             ]
         )
@@ -745,6 +1065,7 @@ def remember_user(user: types.User) -> None:
 
 
 def clear_user_runtime_cache(tg_user_id: int) -> None:
+    clear_active_chat_view(tg_user_id)
     CHAT_CACHE.pop(tg_user_id, None)
     media_keys = [key for key, item in MEDIA_CACHE.items() if item.tg_user_id == tg_user_id]
     for key in media_keys:
@@ -755,6 +1076,9 @@ def clear_user_runtime_cache(tg_user_id: int) -> None:
     seen_keys = [key for key in UPDATE_LAST_SEEN if key[0] == tg_user_id]
     for key in seen_keys:
         UPDATE_LAST_SEEN.pop(key, None)
+    unread_keys = [key for key in UNREAD_COUNTS if key[0] == tg_user_id]
+    for key in unread_keys:
+        UNREAD_COUNTS.pop(key, None)
 
 
 async def get_chat_entries(
@@ -1221,6 +1545,14 @@ async def build_history_text(
             f"{separator.join(selected_blocks)}"
         )
 
+    active_view = ACTIVE_CHAT_VIEWS.get(tg_user_id)
+    auto_paused = bool(
+        offset == 0
+        and active_view is not None
+        and active_view.chat_id == chat_id
+        and active_view.paused
+    )
+
     keyboard = build_history_keyboard(
         chat_id=chat_id,
         offset=offset,
@@ -1230,6 +1562,7 @@ async def build_history_text(
         page_step=page_step,
         show_members=show_members,
         profile_user_id=profile_user_id,
+        auto_refresh_paused=auto_paused,
     )
     return content, keyboard
 
@@ -1480,6 +1813,14 @@ async def poll_updates_for_user(tg_user_id: int) -> None:
         if last_event <= last_seen:
             continue
 
+        active_view = ACTIVE_CHAT_VIEWS.get(tg_user_id)
+        is_live_view = bool(
+            active_view
+            and active_view.chat_id == entry.chat_id
+            and active_view.offset == 0
+            and not active_view.paused
+        )
+
         try:
             history = await client.fetch_history(
                 chat_id=entry.chat_id,
@@ -1515,6 +1856,7 @@ async def poll_updates_for_user(tg_user_id: int) -> None:
                 users_map = {}
 
         max_sent_time = last_seen
+        incoming_count = 0
         for msg in new_messages:
             msg_time = int(getattr(msg, "time", 0) or 0)
             if msg_time > max_sent_time:
@@ -1522,6 +1864,10 @@ async def poll_updates_for_user(tg_user_id: int) -> None:
 
             sender_id = parse_int(str(getattr(msg, "sender", 0)), default=0)
             if sender_id and sender_id == me_id:
+                continue
+
+            incoming_count += 1
+            if is_live_view:
                 continue
 
             sender_name = user_display_name(users_map.get(sender_id), f"Пользователь {sender_id}")
@@ -1537,10 +1883,146 @@ async def poll_updates_for_user(tg_user_id: int) -> None:
                     text=notify_text,
                     reply_markup=dismiss_message_keyboard(),
                 )
+                METRICS.update_notifications += 1
             except Exception as exc:
                 logger.debug("Could not deliver update to tg=%s: %s", tg_user_id, exc)
 
+        if incoming_count > 0:
+            if is_live_view:
+                mark_chat_read(tg_user_id, entry.chat_id, seen_time=max(max_sent_time, last_event))
+            else:
+                increment_unread_count(tg_user_id, entry.chat_id, incoming_count)
+
         UPDATE_LAST_SEEN[key] = max(max_sent_time, last_event)
+
+
+async def refresh_active_chat_for_user(tg_user_id: int) -> None:
+    view = ACTIVE_CHAT_VIEWS.get(tg_user_id)
+    if view is None or view.paused or view.offset != 0 or view.in_progress:
+        return
+
+    if time.time() - view.last_refresh_at < max(1.0, CHAT_AUTORELOAD_SECONDS - 0.4):
+        return
+
+    view.in_progress = True
+    try:
+        client = await session_manager.ensure_client(tg_user_id)
+        text, keyboard = await build_history_text(
+            tg_user_id=tg_user_id,
+            client=client,
+            chat_id=view.chat_id,
+            offset=0,
+            chat_page=view.chat_page,
+        )
+        signature = chat_view_signature(text, keyboard)
+
+        if signature != view.signature:
+            try:
+                await bot.edit_message_text(
+                    chat_id=view.tg_chat_id,
+                    message_id=view.tg_message_id,
+                    text=text,
+                    reply_markup=keyboard,
+                )
+            except TelegramBadRequest as exc:
+                lowered = str(exc).lower()
+                if "message is not modified" not in lowered:
+                    if "message to edit not found" in lowered or "message can't be edited" in lowered:
+                        clear_active_chat_view(tg_user_id)
+                        return
+                    logger.debug("Auto-refresh edit failed user=%s: %s", tg_user_id, exc)
+
+        current_view = ACTIVE_CHAT_VIEWS.get(tg_user_id)
+        if current_view and current_view.tg_message_id == view.tg_message_id:
+            current_view.signature = signature
+            current_view.last_refresh_at = time.time()
+
+        mark_chat_read(tg_user_id, view.chat_id)
+    except Exception as exc:
+        logger.debug("Skip chat auto-refresh for %s: %s", tg_user_id, exc)
+    finally:
+        current_view = ACTIVE_CHAT_VIEWS.get(tg_user_id)
+        if current_view and current_view.tg_message_id == view.tg_message_id:
+            current_view.in_progress = False
+
+
+async def chat_refresh_loop() -> None:
+    while True:
+        try:
+            for tg_user_id in list(ACTIVE_CHAT_VIEWS.keys()):
+                await refresh_active_chat_for_user(tg_user_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Background chat refresh loop failed")
+        await asyncio.sleep(CHAT_AUTORELOAD_SECONDS)
+
+
+async def flush_outgoing_for_user(tg_user_id: int) -> None:
+    queued = session_manager.fetch_outgoing_messages(tg_user_id, limit=QUEUE_BATCH_SIZE)
+    if not queued:
+        return
+
+    try:
+        client = await session_manager.ensure_client(tg_user_id)
+    except Exception as exc:
+        logger.debug("Skip queue flush for %s: %s", tg_user_id, exc)
+        return
+
+    for item in queued:
+        queue_id = parse_int(str(item.get("id", "0")), default=0)
+        chat_id = parse_int(str(item.get("chat_id", "0")), default=0)
+        text = str(item.get("text") or " ").strip() or " "
+        attachment_path = str(item.get("attachment_path") or "").strip()
+        if queue_id <= 0 or chat_id <= 0:
+            if queue_id > 0:
+                session_manager.mark_outgoing_message_sent(queue_id)
+            continue
+
+        try:
+            attachment = build_outgoing_attachment_from_queue(item)
+            started_at = time.perf_counter()
+            await client.send_message(
+                text=text,
+                chat_id=chat_id,
+                attachment=attachment,
+            )
+            record_send_latency((time.perf_counter() - started_at) * 1000)
+            METRICS.queue_sent += 1
+            session_manager.mark_outgoing_message_sent(queue_id)
+            HISTORY_ANCHORS.pop((tg_user_id, chat_id), None)
+            if attachment_path:
+                with contextlib.suppress(Exception):
+                    os.remove(attachment_path)
+        except Exception as exc:
+            record_send_error("queue", tg_user_id, chat_id, exc)
+            logger.warning(
+                "Queued send failed user=%s chat=%s queue_id=%s: %s",
+                tg_user_id,
+                chat_id,
+                queue_id,
+                exc,
+            )
+            session_manager.mark_outgoing_message_attempt(queue_id, str(exc))
+            if isinstance(exc, FileNotFoundError):
+                session_manager.mark_outgoing_message_sent(queue_id)
+                continue
+            if is_temporary_send_error(exc):
+                with contextlib.suppress(Exception):
+                    await session_manager.disconnect_client(tg_user_id)
+                break
+
+
+async def outgoing_queue_loop() -> None:
+    while True:
+        try:
+            for tg_user_id in session_manager.get_outgoing_user_ids():
+                await flush_outgoing_for_user(tg_user_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Background outgoing queue loop failed")
+        await asyncio.sleep(QUEUE_RETRY_SECONDS)
 
 
 async def updates_loop() -> None:
@@ -1567,6 +2049,7 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
         token = start_payload[6:]
         await session_manager.clear_auth_flow(message.from_user.id)
         await state.clear()
+        clear_active_chat_view(message.from_user.id)
         with contextlib.suppress(Exception):
             await message.delete()
         await send_media_by_token(message, token)
@@ -1574,6 +2057,7 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
 
     await session_manager.clear_auth_flow(message.from_user.id)
     await state.clear()
+    clear_active_chat_view(message.from_user.id)
 
     has_token = session_manager.has_token(message.from_user.id)
     name = " ".join(
@@ -1587,6 +2071,7 @@ async def cmd_menu(message: types.Message, state: FSMContext) -> None:
     remember_user(message.from_user)
     await session_manager.clear_auth_flow(message.from_user.id)
     await state.clear()
+    clear_active_chat_view(message.from_user.id)
     has_token = session_manager.has_token(message.from_user.id)
     name = " ".join(
         part for part in [message.from_user.first_name, message.from_user.last_name] if part
@@ -1599,6 +2084,7 @@ async def cmd_login(message: types.Message, state: FSMContext) -> None:
     remember_user(message.from_user)
     await session_manager.clear_auth_flow(message.from_user.id)
     await state.clear()
+    clear_active_chat_view(message.from_user.id)
     has_token = session_manager.has_token(message.from_user.id)
     await message.answer(auth_menu_text(has_token), reply_markup=auth_methods_keyboard(has_token))
 
@@ -1608,8 +2094,83 @@ async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
     remember_user(message.from_user)
     await session_manager.clear_auth_flow(message.from_user.id)
     await state.clear()
+    clear_active_chat_view(message.from_user.id)
     has_token = session_manager.has_token(message.from_user.id)
     await message.answer("Действие отменено.", reply_markup=main_menu_keyboard(has_token))
+
+
+@dp.message(Command("health"))
+async def cmd_health(message: types.Message) -> None:
+    remember_user(message.from_user)
+    if not is_admin_user(message.from_user.id):
+        return
+
+    uptime = format_duration(int(time.time() - METRICS.started_at))
+    authorized_users = session_manager.get_authorized_user_ids()
+    pending_queue = session_manager.count_pending_outgoing()
+    queue_users = session_manager.get_outgoing_user_ids()
+    latencies = list(METRICS.latencies_ms)
+
+    if latencies:
+        avg_latency = sum(latencies) / len(latencies)
+        p95_latency = percentile(latencies, 0.95)
+        latency_line = f"{avg_latency:.0f}ms avg / {p95_latency:.0f}ms p95"
+    else:
+        latency_line = "нет данных"
+
+    lines = [
+        "<b>Health</b>",
+        f"Uptime: <code>{esc(uptime)}</code>",
+        f"Авторизовано пользователей: <b>{len(authorized_users)}</b>",
+        f"Активных MAX клиентов: <b>{session_manager.active_client_count()}</b>",
+        f"Активных auth-flow: <b>{session_manager.active_auth_flow_count()}</b>",
+        f"Открытых чатов с автообновлением: <b>{len(ACTIVE_CHAT_VIEWS)}</b>",
+        f"Очередь отправки: <b>{pending_queue}</b> (пользователей: {len(queue_users)})",
+        f"Latency отправки: <b>{esc(latency_line)}</b>",
+        f"Updates loop: <b>{'OK' if UPDATE_TASK and not UPDATE_TASK.done() else 'DOWN'}</b>",
+        f"Chat refresh loop: <b>{'OK' if CHAT_REFRESH_TASK and not CHAT_REFRESH_TASK.done() else 'DOWN'}</b>",
+        f"Queue loop: <b>{'OK' if QUEUE_TASK and not QUEUE_TASK.done() else 'DOWN'}</b>",
+    ]
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message) -> None:
+    remember_user(message.from_user)
+    if not is_admin_user(message.from_user.id):
+        return
+
+    latencies = list(METRICS.latencies_ms)
+    if latencies:
+        avg_latency = sum(latencies) / len(latencies)
+        p95_latency = percentile(latencies, 0.95)
+    else:
+        avg_latency = 0.0
+        p95_latency = 0.0
+
+    lines = [
+        "<b>Stats</b>",
+        f"Direct sent: <b>{METRICS.direct_sent}</b>",
+        f"Queued (enqueued): <b>{METRICS.queued_messages}</b>",
+        f"Queued (delivered): <b>{METRICS.queue_sent}</b>",
+        f"Send failures: <b>{METRICS.send_failures}</b>",
+        f"Update notifications: <b>{METRICS.update_notifications}</b>",
+        f"Pending queue now: <b>{session_manager.count_pending_outgoing()}</b>",
+        f"Unread now: <b>{sum(UNREAD_COUNTS.values())}</b>",
+        f"Latency avg/p95: <b>{avg_latency:.0f}ms / {p95_latency:.0f}ms</b>",
+    ]
+
+    recent = list(METRICS.send_errors)[-8:]
+    if recent:
+        lines.append("")
+        lines.append("<b>Последние ошибки отправки:</b>")
+        for event in recent:
+            stamp = datetime.fromtimestamp(event.at).strftime("%H:%M:%S")
+            lines.append(
+                f"• <code>{esc(stamp)}</code> [{esc(event.source)}] "
+                f"u{event.tg_user_id} c{event.chat_id}: {esc(event.error)}"
+            )
+    await message.answer("\n".join(lines))
 
 
 @dp.callback_query(F.data == "menu:main")
@@ -1618,6 +2179,7 @@ async def cb_menu_main(callback: types.CallbackQuery, state: FSMContext) -> None
         remember_user(callback.from_user)
     await session_manager.clear_auth_flow(callback.from_user.id)
     await state.clear()
+    clear_active_chat_view(callback.from_user.id)
     has_token = session_manager.has_token(callback.from_user.id)
     name = " ".join(
         part for part in [callback.from_user.first_name, callback.from_user.last_name] if part
@@ -1639,6 +2201,7 @@ async def cb_profile_me(callback: types.CallbackQuery, state: FSMContext) -> Non
         remember_user(callback.from_user)
     await session_manager.clear_auth_flow(callback.from_user.id)
     await state.clear()
+    clear_active_chat_view(callback.from_user.id)
 
     has_token = session_manager.has_token(callback.from_user.id)
     if not has_token:
@@ -1685,6 +2248,7 @@ async def cb_profile_me(callback: types.CallbackQuery, state: FSMContext) -> Non
 async def cb_logout_confirm(callback: types.CallbackQuery) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    clear_active_chat_view(callback.from_user.id)
     await safe_edit_message(
         callback.message,
         "<b>Выход из MAX</b>\n\nПодтвердить выход из аккаунта?",
@@ -1699,6 +2263,7 @@ async def cb_logout_cancel(callback: types.CallbackQuery, state: FSMContext) -> 
         remember_user(callback.from_user)
     await session_manager.clear_auth_flow(callback.from_user.id)
     await state.clear()
+    clear_active_chat_view(callback.from_user.id)
 
     has_token = session_manager.has_token(callback.from_user.id)
     if not has_token:
@@ -1776,6 +2341,7 @@ async def cb_auth_menu(callback: types.CallbackQuery, state: FSMContext) -> None
         remember_user(callback.from_user)
     await session_manager.clear_auth_flow(callback.from_user.id)
     await state.clear()
+    clear_active_chat_view(callback.from_user.id)
     has_token = session_manager.has_token(callback.from_user.id)
     await safe_edit_message(
         callback.message,
@@ -1789,6 +2355,7 @@ async def cb_auth_menu(callback: types.CallbackQuery, state: FSMContext) -> None
 async def cb_auth_token(callback: types.CallbackQuery, state: FSMContext) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    clear_active_chat_view(callback.from_user.id)
     with contextlib.suppress(TelegramBadRequest):
         await callback.answer()
     await session_manager.clear_auth_flow(callback.from_user.id)
@@ -1804,6 +2371,7 @@ async def cb_auth_token(callback: types.CallbackQuery, state: FSMContext) -> Non
 async def cb_auth_qr(callback: types.CallbackQuery, state: FSMContext) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    clear_active_chat_view(callback.from_user.id)
     await state.clear()
 
     if callback.data == "auth:qr":
@@ -1838,6 +2406,7 @@ async def cb_auth_qr(callback: types.CallbackQuery, state: FSMContext) -> None:
 async def cb_auth_qr_check(callback: types.CallbackQuery, state: FSMContext) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    clear_active_chat_view(callback.from_user.id)
 
     try:
         status, token = await session_manager.check_qr_login(callback.from_user.id)
@@ -1889,6 +2458,7 @@ async def cb_auth_qr_check(callback: types.CallbackQuery, state: FSMContext) -> 
 async def cb_token_set(callback: types.CallbackQuery, state: FSMContext) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    clear_active_chat_view(callback.from_user.id)
     with contextlib.suppress(TelegramBadRequest):
         await callback.answer()
     await session_manager.clear_auth_flow(callback.from_user.id)
@@ -1925,6 +2495,17 @@ async def cb_flow_cancel(callback: types.CallbackQuery, state: FSMContext) -> No
                     chat_page=chat_page,
                 )
                 await safe_edit_message(callback.message, text, keyboard)
+                set_active_chat_view(
+                    tg_user_id=callback.from_user.id,
+                    tg_chat_id=callback.message.chat.id,
+                    tg_message_id=callback.message.message_id,
+                    chat_id=chat_id,
+                    chat_page=chat_page,
+                    offset=0,
+                    signature=chat_view_signature(text, keyboard),
+                    paused=False,
+                )
+                mark_chat_read(callback.from_user.id, chat_id)
                 return
             except Exception as exc:
                 logger.warning(
@@ -1940,6 +2521,7 @@ async def cb_flow_cancel(callback: types.CallbackQuery, state: FSMContext) -> No
     await cleanup_auth_instruction_messages(state, callback.message.chat.id)
     await session_manager.clear_auth_flow(callback.from_user.id)
     await state.clear()
+    clear_active_chat_view(callback.from_user.id)
     with contextlib.suppress(Exception):
         await callback.message.delete()
     if is_token_flow:
@@ -1998,6 +2580,7 @@ async def input_token(message: types.Message, state: FSMContext) -> None:
 async def cb_chats(callback: types.CallbackQuery) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    clear_active_chat_view(callback.from_user.id)
 
     page = parse_int((callback.data or "").split(":", maxsplit=1)[1], default=0)
 
@@ -2031,16 +2614,72 @@ async def cb_chats(callback: types.CallbackQuery) -> None:
             await callback.answer()
             return
 
-        keyboard, current_page, total_pages = build_chats_keyboard(entries, page)
+        keyboard, current_page, total_pages = build_chats_keyboard(
+            entries,
+            page,
+            callback.from_user.id,
+        )
+        unread_total = total_unread_for_user(callback.from_user.id)
+        unread_line = f"\nНепрочитанные: <b>{unread_total}</b>" if unread_total > 0 else ""
         text = (
             "<b>Твои чаты в MAX</b>\n"
             f"Страница <b>{current_page + 1}/{total_pages}</b>\n"
             "Нажми на чат, чтобы открыть последние сообщения."
+            f"{unread_line}"
         )
         await safe_edit_message(callback.message, text, keyboard)
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to load chats for user %s", callback.from_user.id)
+        await callback.answer("Ошибка, попробуйте позже", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("readall:"))
+async def cb_read_all(callback: types.CallbackQuery) -> None:
+    if callback.from_user:
+        remember_user(callback.from_user)
+    clear_active_chat_view(callback.from_user.id)
+
+    parts = (callback.data or "").split(":")
+    if len(parts) != 2:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    page = max(0, parse_int(parts[1], default=0))
+    if not session_manager.has_token(callback.from_user.id):
+        await callback.answer("Сначала авторизуйся в MAX", show_alert=True)
+        return
+
+    try:
+        client = await session_manager.ensure_client(callback.from_user.id)
+        entries = await get_chat_entries(callback.from_user.id, client, force_refresh=True)
+
+        for entry in entries:
+            if entry.last_event_time > 0:
+                UPDATE_LAST_SEEN[(callback.from_user.id, entry.chat_id)] = max(
+                    UPDATE_LAST_SEEN.get((callback.from_user.id, entry.chat_id), 0),
+                    int(entry.last_event_time),
+                )
+
+        cleared = clear_all_unread_for_user(callback.from_user.id)
+
+        keyboard, current_page, total_pages = build_chats_keyboard(
+            entries,
+            page,
+            callback.from_user.id,
+        )
+        unread_total = total_unread_for_user(callback.from_user.id)
+        unread_line = f"\nНепрочитанные: <b>{unread_total}</b>" if unread_total > 0 else ""
+        text = (
+            "<b>Твои чаты в MAX</b>\n"
+            f"Страница <b>{current_page + 1}/{total_pages}</b>\n"
+            "Нажми на чат, чтобы открыть последние сообщения."
+            f"{unread_line}"
+        )
+        await safe_edit_message(callback.message, text, keyboard)
+        await callback.answer(f"Отмечено прочитанным: {cleared}")
+    except Exception:
+        logger.exception("Failed to mark all chats as read for %s", callback.from_user.id)
         await callback.answer("Ошибка, попробуйте позже", show_alert=True)
 
 
@@ -2072,9 +2711,79 @@ async def cb_chat(callback: types.CallbackQuery) -> None:
             chat_page=chat_page,
         )
         await safe_edit_message(callback.message, text, keyboard)
+        set_active_chat_view(
+            tg_user_id=callback.from_user.id,
+            tg_chat_id=callback.message.chat.id,
+            tg_message_id=callback.message.message_id,
+            chat_id=chat_id,
+            chat_page=chat_page,
+            offset=offset,
+            signature=chat_view_signature(text, keyboard),
+            paused=False,
+        )
+        if offset == 0:
+            mark_chat_read(callback.from_user.id, chat_id)
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to open chat %s for user %s", chat_id, callback.from_user.id)
+        await callback.answer("Ошибка, попробуйте позже", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("chatauto:"))
+async def cb_chat_auto_refresh(callback: types.CallbackQuery) -> None:
+    if callback.from_user:
+        remember_user(callback.from_user)
+
+    parts = (callback.data or "").split(":")
+    if len(parts) != 4:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    action = parts[1]
+    chat_id = parse_int(parts[2], default=0)
+    chat_page = max(0, parse_int(parts[3], default=0))
+    if chat_id <= 0 or action not in {"pause", "resume"}:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    paused = action == "pause"
+    view = ACTIVE_CHAT_VIEWS.get(callback.from_user.id)
+    if view and view.chat_id == chat_id and view.tg_message_id == callback.message.message_id:
+        view.paused = paused
+        view.chat_page = chat_page
+        view.offset = 0
+    else:
+        set_active_chat_view(
+            tg_user_id=callback.from_user.id,
+            tg_chat_id=callback.message.chat.id,
+            tg_message_id=callback.message.message_id,
+            chat_id=chat_id,
+            chat_page=chat_page,
+            offset=0,
+            signature="",
+            paused=paused,
+        )
+
+    try:
+        client = await session_manager.ensure_client(callback.from_user.id)
+        text, keyboard = await build_history_text(
+            tg_user_id=callback.from_user.id,
+            client=client,
+            chat_id=chat_id,
+            offset=0,
+            chat_page=chat_page,
+        )
+        await safe_edit_message(callback.message, text, keyboard)
+        current_view = ACTIVE_CHAT_VIEWS.get(callback.from_user.id)
+        if current_view and current_view.chat_id == chat_id:
+            current_view.signature = chat_view_signature(text, keyboard)
+            current_view.last_refresh_at = time.time()
+            current_view.paused = paused
+        if not paused:
+            mark_chat_read(callback.from_user.id, chat_id)
+        await callback.answer("Пауза включена" if paused else "Автообновление включено")
+    except Exception:
+        logger.exception("Failed to toggle chat auto refresh for user=%s chat=%s", callback.from_user.id, chat_id)
         await callback.answer("Ошибка, попробуйте позже", show_alert=True)
 
 
@@ -2082,6 +2791,7 @@ async def cb_chat(callback: types.CallbackQuery) -> None:
 async def cb_profile_from_chat(callback: types.CallbackQuery) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    clear_active_chat_view(callback.from_user.id)
 
     parts = (callback.data or "").split(":")
     if len(parts) != 5:
@@ -2122,6 +2832,7 @@ async def cb_profile_from_chat(callback: types.CallbackQuery) -> None:
 async def cb_members(callback: types.CallbackQuery) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    clear_active_chat_view(callback.from_user.id)
 
     parts = (callback.data or "").split(":")
     if len(parts) != 5:
@@ -2215,6 +2926,7 @@ async def cb_members(callback: types.CallbackQuery) -> None:
 async def cb_member_profile(callback: types.CallbackQuery) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    clear_active_chat_view(callback.from_user.id)
 
     parts = (callback.data or "").split(":")
     if len(parts) != 6:
@@ -2291,7 +3003,18 @@ async def cb_open_private_chat(callback: types.CallbackQuery) -> None:
         )
         with contextlib.suppress(Exception):
             await callback.message.delete()
-        await callback.message.answer(text, reply_markup=keyboard)
+        sent = await callback.message.answer(text, reply_markup=keyboard)
+        set_active_chat_view(
+            tg_user_id=callback.from_user.id,
+            tg_chat_id=sent.chat.id,
+            tg_message_id=sent.message_id,
+            chat_id=dm_chat_id,
+            chat_page=chat_page,
+            offset=0,
+            signature=chat_view_signature(text, keyboard),
+            paused=False,
+        )
+        mark_chat_read(callback.from_user.id, dm_chat_id)
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to open private chat with user %s", user_id)
@@ -2302,6 +3025,7 @@ async def cb_open_private_chat(callback: types.CallbackQuery) -> None:
 async def cb_write(callback: types.CallbackQuery, state: FSMContext) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    clear_active_chat_view(callback.from_user.id)
 
     parts = (callback.data or "").split(":")
     if len(parts) != 3:
@@ -2396,16 +3120,34 @@ async def send_message_to_chat(message: types.Message, state: FSMContext) -> Non
         await bot.send_message(chat_id=message.chat.id, text=hint_text)
         return
 
+    outgoing_text = text if text else " "
+    attachment_kind = outgoing_attachment_kind(attachment)
+    attachment_name = ""
+    if message.document and getattr(message.document, "file_name", None):
+        attachment_name = str(message.document.file_name)
+    elif message.video and getattr(message.video, "file_name", None):
+        attachment_name = str(message.video.file_name)
+    elif message.animation and getattr(message.animation, "file_name", None):
+        attachment_name = str(message.animation.file_name)
+    elif message.audio and getattr(message.audio, "file_name", None):
+        attachment_name = str(message.audio.file_name)
+    elif temp_path:
+        attachment_name = os.path.basename(temp_path)
+
     try:
+        started_at = time.perf_counter()
         client = await session_manager.ensure_client(message.from_user.id)
         await client.send_message(
-            text=text if text else " ",
+            text=outgoing_text,
             chat_id=chat_id,
             attachment=attachment,
         )
+        record_send_latency((time.perf_counter() - started_at) * 1000)
+        METRICS.direct_sent += 1
         await state.clear()
 
         HISTORY_ANCHORS.pop((message.from_user.id, chat_id), None)
+        mark_chat_read(message.from_user.id, chat_id)
         history_text, history_keyboard = await build_history_text(
             tg_user_id=message.from_user.id,
             client=client,
@@ -2414,6 +3156,8 @@ async def send_message_to_chat(message: types.Message, state: FSMContext) -> Non
             chat_page=chat_page,
         )
 
+        target_chat_id = message.chat.id
+        target_message_id = prompt_message_id
         if prompt_message_id > 0:
             try:
                 await bot.edit_message_text(
@@ -2423,22 +3167,100 @@ async def send_message_to_chat(message: types.Message, state: FSMContext) -> Non
                     reply_markup=history_keyboard,
                 )
             except TelegramBadRequest:
-                await bot.send_message(
+                sent = await bot.send_message(
                     chat_id=message.chat.id,
                     text=history_text,
                     reply_markup=history_keyboard,
                 )
+                target_chat_id = sent.chat.id
+                target_message_id = sent.message_id
         else:
-            await bot.send_message(
+            sent = await bot.send_message(
                 chat_id=message.chat.id,
                 text=history_text,
                 reply_markup=history_keyboard,
+            )
+            target_chat_id = sent.chat.id
+            target_message_id = sent.message_id
+
+        if target_message_id > 0:
+            set_active_chat_view(
+                tg_user_id=message.from_user.id,
+                tg_chat_id=target_chat_id,
+                tg_message_id=target_message_id,
+                chat_id=chat_id,
+                chat_page=chat_page,
+                offset=0,
+                signature=chat_view_signature(history_text, history_keyboard),
+                paused=False,
             )
 
         if write_callback_query_id:
             with contextlib.suppress(Exception):
                 await bot.answer_callback_query(write_callback_query_id, text="Отправлено")
     except Exception as exc:
+        record_send_error("direct", message.from_user.id, chat_id, exc)
+        is_temporary = is_temporary_send_error(exc)
+        if is_temporary:
+            logger.warning(
+                "Temporary send failure for user=%s chat=%s; queueing message: %s",
+                message.from_user.id,
+                chat_id,
+                exc,
+            )
+
+            queued_path: str | None = None
+            if temp_path:
+                try:
+                    queued_path = persist_outgoing_attachment(
+                        tg_user_id=message.from_user.id,
+                        temp_path=temp_path,
+                        source_name=attachment_name,
+                    )
+                    temp_path = None
+                except Exception as move_exc:
+                    logger.warning("Could not persist attachment for outgoing queue: %s", move_exc)
+
+            queue_id = session_manager.enqueue_outgoing_message(
+                tg_user_id=message.from_user.id,
+                chat_id=chat_id,
+                text=outgoing_text,
+                attachment_type=attachment_kind if queued_path else None,
+                attachment_path=queued_path,
+                attachment_name=attachment_name or None,
+            )
+            METRICS.queued_messages += 1
+            await state.clear()
+            clear_active_chat_view(message.from_user.id)
+
+            queue_text = (
+                "📥 MAX временно недоступен.\n"
+                f"Сообщение добавлено в очередь <code>#{queue_id}</code> и будет отправлено автоматически."
+            )
+            delivered_notice = False
+            if prompt_message_id > 0:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=message.chat.id,
+                        message_id=prompt_message_id,
+                        text=queue_text,
+                        reply_markup=queued_message_keyboard(chat_id, chat_page),
+                    )
+                    delivered_notice = True
+                except Exception:
+                    delivered_notice = False
+            if not delivered_notice:
+                await bot.send_message(
+                    chat_id=message.chat.id,
+                    text=queue_text,
+                    reply_markup=queued_message_keyboard(chat_id, chat_page),
+                )
+
+            if write_callback_query_id:
+                with contextlib.suppress(Exception):
+                    await bot.answer_callback_query(write_callback_query_id, text="В очереди")
+            return
+
         logger.exception("Failed to send message for user %s", message.from_user.id)
         error_text = (
             f"❌ Не удалось отправить сообщение: <code>{esc(exc)}</code>\n"
@@ -2463,6 +3285,7 @@ async def send_message_to_chat(message: types.Message, state: FSMContext) -> Non
 @dp.message(F.text.startswith("/media_"))
 async def cmd_media_link(message: types.Message, state: FSMContext) -> None:
     remember_user(message.from_user)
+    clear_active_chat_view(message.from_user.id)
     match = MEDIA_CMD_REGEX.match((message.text or "").strip())
     if not match:
         return
@@ -2486,23 +3309,28 @@ async def fallback_text(message: types.Message, state: FSMContext) -> None:
 
 
 async def main() -> None:
-    global UPDATE_TASK
+    global UPDATE_TASK, CHAT_REFRESH_TASK, QUEUE_TASK
     logger.info("Bot is starting")
     os.makedirs("sessions", exist_ok=True)
+    os.makedirs(OUTBOX_DIR, exist_ok=True)
     try:
         await ensure_bot_username()
     except Exception as exc:
         logger.warning("Could not resolve bot username for media links: %s", exc)
 
     UPDATE_TASK = asyncio.create_task(updates_loop(), name="max-updates-loop")
+    CHAT_REFRESH_TASK = asyncio.create_task(chat_refresh_loop(), name="max-chat-refresh-loop")
+    QUEUE_TASK = asyncio.create_task(outgoing_queue_loop(), name="max-outgoing-queue-loop")
     try:
         await dp.start_polling(bot)
     finally:
-        if UPDATE_TASK:
-            UPDATE_TASK.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await UPDATE_TASK
-            UPDATE_TASK = None
+        for task_name in ("QUEUE_TASK", "CHAT_REFRESH_TASK", "UPDATE_TASK"):
+            task = globals().get(task_name)
+            if isinstance(task, asyncio.Task):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                globals()[task_name] = None
         await session_manager.shutdown()
         await bot.session.close()
 

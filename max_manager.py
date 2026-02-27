@@ -109,6 +109,26 @@ class UserStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS outgoing_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tg_user_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    attachment_type TEXT,
+                    attachment_path TEXT,
+                    attachment_name TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outgoing_queue_user_id ON outgoing_queue(tg_user_id, id)"
+            )
             conn.commit()
 
     def register_user(
@@ -192,6 +212,109 @@ class UserStore:
             ).fetchall()
         return [int(row[0]) for row in rows]
 
+    def enqueue_outgoing(
+        self,
+        tg_user_id: int,
+        chat_id: int,
+        text: str,
+        attachment_type: str | None = None,
+        attachment_path: str | None = None,
+        attachment_name: str | None = None,
+    ) -> int:
+        now = int(time.time())
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO outgoing_queue (
+                    tg_user_id,
+                    chat_id,
+                    text,
+                    attachment_type,
+                    attachment_path,
+                    attachment_name,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tg_user_id,
+                    chat_id,
+                    text,
+                    attachment_type,
+                    attachment_path,
+                    attachment_name,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            return int(cursor.lastrowid or 0)
+
+    def fetch_outgoing(self, tg_user_id: int, limit: int = 25) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    tg_user_id,
+                    chat_id,
+                    text,
+                    attachment_type,
+                    attachment_path,
+                    attachment_name,
+                    attempt_count,
+                    last_error,
+                    created_at,
+                    updated_at
+                FROM outgoing_queue
+                WHERE tg_user_id = ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (tg_user_id, max(1, int(limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_outgoing_sent(self, queue_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM outgoing_queue WHERE id = ?", (queue_id,))
+            conn.commit()
+
+    def mark_outgoing_attempt(self, queue_id: int, error_text: str) -> None:
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE outgoing_queue
+                SET attempt_count = attempt_count + 1,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (error_text[:1000], now, queue_id),
+            )
+            conn.commit()
+
+    def count_outgoing(self, tg_user_id: int | None = None) -> int:
+        with self._connect() as conn:
+            if tg_user_id is None:
+                row = conn.execute("SELECT COUNT(1) FROM outgoing_queue").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(1) FROM outgoing_queue WHERE tg_user_id = ?",
+                    (tg_user_id,),
+                ).fetchone()
+        return int(row[0] if row else 0)
+
+    def list_outgoing_user_ids(self) -> list[int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT tg_user_id FROM outgoing_queue ORDER BY tg_user_id ASC"
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
 
 @dataclass
 class _ClientContext:
@@ -241,6 +364,45 @@ class MaxSessionManager:
 
     def get_authorized_user_ids(self) -> list[int]:
         return self.store.list_token_user_ids()
+
+    def active_client_count(self) -> int:
+        return len(self._contexts)
+
+    def active_auth_flow_count(self) -> int:
+        return len(self._auth_contexts)
+
+    def enqueue_outgoing_message(
+        self,
+        tg_user_id: int,
+        chat_id: int,
+        text: str,
+        attachment_type: str | None = None,
+        attachment_path: str | None = None,
+        attachment_name: str | None = None,
+    ) -> int:
+        return self.store.enqueue_outgoing(
+            tg_user_id=tg_user_id,
+            chat_id=chat_id,
+            text=text,
+            attachment_type=attachment_type,
+            attachment_path=attachment_path,
+            attachment_name=attachment_name,
+        )
+
+    def fetch_outgoing_messages(self, tg_user_id: int, limit: int = 25) -> list[dict[str, Any]]:
+        return self.store.fetch_outgoing(tg_user_id=tg_user_id, limit=limit)
+
+    def mark_outgoing_message_sent(self, queue_id: int) -> None:
+        self.store.mark_outgoing_sent(queue_id)
+
+    def mark_outgoing_message_attempt(self, queue_id: int, error_text: str) -> None:
+        self.store.mark_outgoing_attempt(queue_id, error_text)
+
+    def count_pending_outgoing(self, tg_user_id: int | None = None) -> int:
+        return self.store.count_outgoing(tg_user_id=tg_user_id)
+
+    def get_outgoing_user_ids(self) -> list[int]:
+        return self.store.list_outgoing_user_ids()
 
     async def validate_and_save_token(self, tg_user_id: int, token: str) -> None:
         old_token = self.store.get_token(tg_user_id)

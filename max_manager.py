@@ -6,8 +6,10 @@ import shutil
 import sqlite3
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from pymax import MaxClient
+from pymax.static.enum import Opcode
 
 logger = logging.getLogger(__name__)
 _INVALID_TOKEN_RE = re.compile(r"(Invalid token:\s*)(\S+)", re.IGNORECASE)
@@ -107,6 +109,13 @@ class UserStore:
             )
             conn.commit()
 
+    def list_token_user_ids(self) -> list[int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tg_user_id FROM users WHERE max_token IS NOT NULL AND max_token != ''"
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
 
 @dataclass
 class _ClientContext:
@@ -114,10 +123,22 @@ class _ClientContext:
     task: asyncio.Task | None = None
 
 
+@dataclass
+class _AuthContext:
+    kind: str
+    client: MaxClient
+    phone: str
+    temp_token: str | None = None
+    track_id: str | None = None
+    qr_link: str | None = None
+    qr_expires_at: int | None = None
+
+
 class MaxSessionManager:
     def __init__(self, db_path: str = "sessions/users.db") -> None:
         self.store = UserStore(db_path)
         self._contexts: dict[int, _ClientContext] = {}
+        self._auth_contexts: dict[int, _AuthContext] = {}
         self._locks: dict[int, asyncio.Lock] = {}
 
     def _get_lock(self, tg_user_id: int) -> asyncio.Lock:
@@ -141,6 +162,9 @@ class MaxSessionManager:
 
     def has_token(self, tg_user_id: int) -> bool:
         return bool(self.store.get_token(tg_user_id))
+
+    def get_authorized_user_ids(self) -> list[int]:
+        return self.store.list_token_user_ids()
 
     async def validate_and_save_token(self, tg_user_id: int, token: str) -> None:
         old_token = self.store.get_token(tg_user_id)
@@ -213,6 +237,130 @@ class MaxSessionManager:
         for _, ctx in items:
             await self._stop_context(ctx)
 
+        auth_items = list(self._auth_contexts.items())
+        self._auth_contexts.clear()
+        for _, auth_ctx in auth_items:
+            await self._hard_close_client(auth_ctx.client)
+
+    async def begin_phone_login(self, tg_user_id: int, phone: str) -> str:
+        lock = self._get_lock(tg_user_id)
+        async with lock:
+            await self._clear_auth_context_locked(tg_user_id)
+            self._reset_auth_session_cache(tg_user_id)
+            auth_client = await self._create_auth_client(phone, self._auth_session_dir(tg_user_id))
+
+            try:
+                temp_token = await auth_client.request_code(phone)
+                if not temp_token:
+                    raise ValueError("MAX не вернул временный токен для подтверждения кода.")
+            except Exception as exc:
+                await self._hard_close_client(auth_client)
+                raise ValueError(self._humanize_auth_flow_error(exc)) from exc
+
+            self._auth_contexts[tg_user_id] = _AuthContext(
+                kind="phone",
+                client=auth_client,
+                phone=phone,
+                temp_token=temp_token,
+            )
+            return phone
+
+    async def complete_phone_login(self, tg_user_id: int, code: str) -> str:
+        lock = self._get_lock(tg_user_id)
+        async with lock:
+            auth_ctx = self._auth_contexts.get(tg_user_id)
+            if auth_ctx is None or auth_ctx.kind != "phone" or not auth_ctx.temp_token:
+                raise ValueError("Сначала выбери вход по телефону и запроси код.")
+
+            try:
+                payload = await auth_ctx.client._send_code(code=code, token=auth_ctx.temp_token)
+                token = self._extract_login_token(payload)
+            except Exception as exc:
+                raise ValueError(self._humanize_auth_flow_error(exc)) from exc
+
+            await self._clear_auth_context_locked(tg_user_id)
+            return token
+
+    async def begin_qr_login(self, tg_user_id: int) -> dict[str, str | int]:
+        lock = self._get_lock(tg_user_id)
+        async with lock:
+            await self._clear_auth_context_locked(tg_user_id)
+            self._reset_auth_session_cache(tg_user_id)
+            auth_client = await self._create_auth_client(
+                phone=self._client_phone(tg_user_id),
+                work_dir=self._auth_session_dir(tg_user_id),
+            )
+
+            try:
+                payload = await auth_client._request_qr_login()
+                track_id = payload.get("trackId")
+                qr_link = payload.get("qrLink")
+                expires_at = payload.get("expiresAt")
+                if not track_id or not qr_link or not expires_at:
+                    raise ValueError("MAX вернул неполные данные QR-авторизации.")
+            except Exception as exc:
+                await self._hard_close_client(auth_client)
+                raise ValueError(self._humanize_auth_flow_error(exc)) from exc
+
+            self._auth_contexts[tg_user_id] = _AuthContext(
+                kind="qr",
+                client=auth_client,
+                phone=self._client_phone(tg_user_id),
+                track_id=str(track_id),
+                qr_link=str(qr_link),
+                qr_expires_at=int(expires_at),
+            )
+            return {
+                "qr_link": str(qr_link),
+                "expires_at": int(expires_at),
+            }
+
+    async def check_qr_login(self, tg_user_id: int) -> tuple[str, str | None]:
+        lock = self._get_lock(tg_user_id)
+        async with lock:
+            auth_ctx = self._auth_contexts.get(tg_user_id)
+            if auth_ctx is None or auth_ctx.kind != "qr" or not auth_ctx.track_id:
+                raise ValueError("Сначала запроси QR-код для входа.")
+
+            now = int(time.time() * 1000)
+            if auth_ctx.qr_expires_at and now >= auth_ctx.qr_expires_at:
+                await self._clear_auth_context_locked(tg_user_id)
+                return "expired", None
+
+            try:
+                data = await auth_ctx.client._send_and_wait(
+                    opcode=Opcode.GET_QR_STATUS,
+                    payload={"trackId": auth_ctx.track_id},
+                )
+                payload = data.get("payload", {}) if isinstance(data, dict) else {}
+                status = payload.get("status") if isinstance(payload, dict) else {}
+                if isinstance(status, dict):
+                    expires_at = status.get("expiresAt")
+                    if isinstance(expires_at, (int, float)):
+                        auth_ctx.qr_expires_at = int(expires_at)
+                else:
+                    status = {}
+
+                if status.get("loginAvailable"):
+                    login_payload = await auth_ctx.client._get_qr_login_data(auth_ctx.track_id)
+                    token = self._extract_login_token(login_payload)
+                    await self._clear_auth_context_locked(tg_user_id)
+                    return "ready", token
+            except Exception as exc:
+                raise ValueError(self._humanize_auth_flow_error(exc)) from exc
+
+            now = int(time.time() * 1000)
+            if auth_ctx.qr_expires_at and now >= auth_ctx.qr_expires_at:
+                await self._clear_auth_context_locked(tg_user_id)
+                return "expired", None
+
+            return "pending", None
+
+    async def clear_auth_flow(self, tg_user_id: int) -> None:
+        lock = self._get_lock(tg_user_id)
+        async with lock:
+            await self._clear_auth_context_locked(tg_user_id)
+
     async def _stop_context(self, ctx: _ClientContext) -> None:
         await self._hard_close_client(ctx.client)
 
@@ -244,6 +392,10 @@ class MaxSessionManager:
         return os.path.join("sessions", f"user_{tg_user_id}")
 
     @staticmethod
+    def _auth_session_dir(tg_user_id: int) -> str:
+        return os.path.join("sessions", f"user_{tg_user_id}_auth")
+
+    @staticmethod
     def _client_phone(tg_user_id: int) -> str:
         # pymax validates phone format even when token auth is used.
         # Build a deterministic placeholder in E.164 style.
@@ -254,6 +406,43 @@ class MaxSessionManager:
         if os.path.isdir(session_dir):
             shutil.rmtree(session_dir, ignore_errors=True)
         os.makedirs(session_dir, exist_ok=True)
+
+    def _reset_auth_session_cache(self, tg_user_id: int) -> None:
+        session_dir = self._auth_session_dir(tg_user_id)
+        if os.path.isdir(session_dir):
+            shutil.rmtree(session_dir, ignore_errors=True)
+        os.makedirs(session_dir, exist_ok=True)
+
+    async def _create_auth_client(self, phone: str, work_dir: str) -> MaxClient:
+        client = MaxClient(
+            phone=phone,
+            work_dir=work_dir,
+            reconnect=False,
+        )
+        try:
+            await client.connect(client.user_agent)
+            return client
+        except Exception:
+            await self._hard_close_client(client)
+            raise
+
+    async def _clear_auth_context_locked(self, tg_user_id: int) -> None:
+        auth_ctx = self._auth_contexts.pop(tg_user_id, None)
+        if auth_ctx:
+            await self._hard_close_client(auth_ctx.client)
+            self._reset_auth_session_cache(tg_user_id)
+
+    @staticmethod
+    def _extract_login_token(payload: dict[str, Any]) -> str:
+        login_attrs = payload.get("tokenAttrs", {}).get("LOGIN", {})
+        token = login_attrs.get("token")
+        if token:
+            return str(token)
+        if payload.get("passwordChallenge"):
+            raise ValueError(
+                "Аккаунт требует пароль 2FA. Через бота этот шаг не поддержан, используй вход через готовый токен."
+            )
+        raise ValueError("MAX не вернул login token после подтверждения авторизации.")
 
     @staticmethod
     def _redact_sensitive(text: str) -> str:
@@ -268,4 +457,18 @@ class MaxSessionManager:
             return "MAX отклонил токен (login.token). Возьми свежий токен из WEB-сессии MAX и отправь снова."
         if "timeout" in lowered or "подключ" in lowered:
             return "Не удалось подключиться к MAX из-за сети/таймаута. Повтори попытку."
+        return f"Ошибка авторизации в MAX: {text}"
+
+    def _humanize_auth_flow_error(self, exc: Exception) -> str:
+        text = self._redact_sensitive(str(exc))
+        lowered = text.lower()
+
+        if "invalid phone" in lowered or "номер" in lowered:
+            return "Некорректный номер телефона. Используй международный формат, например +79991234567."
+        if "verify" in lowered or "code" in lowered or "код" in lowered:
+            return "Код подтверждения не подошел. Проверь код и попробуй снова."
+        if "expired" in lowered:
+            return "QR-код уже истек. Запроси новый QR и повтори попытку."
+        if "timeout" in lowered or "send and wait failed" in lowered:
+            return "Не удалось связаться с MAX (таймаут/сеть). Попробуй еще раз."
         return f"Ошибка авторизации в MAX: {text}"

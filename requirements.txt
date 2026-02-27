@@ -1,3 +1,4 @@
 aiogram>=3.4.0
 maxapi-python>=1.0.0
 requests
+cryptography>=42.0.0

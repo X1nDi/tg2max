@@ -8,23 +8,91 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from cryptography.fernet import Fernet, InvalidToken
 from pymax import MaxClient
 from pymax.static.enum import Opcode
 
 logger = logging.getLogger(__name__)
 _INVALID_TOKEN_RE = re.compile(r"(Invalid token:\s*)(\S+)", re.IGNORECASE)
+_TOKEN_PREFIX = "enc:v1:"
+_TOKEN_ENCRYPTION_KEY_ENV = "TOKEN_ENCRYPTION_KEY"
 
 
 class UserStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
+        self._fernet = self._build_fernet()
         db_dir = os.path.dirname(db_path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
         self._init_schema()
+        self._migrate_plaintext_tokens()
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
+
+    def _build_fernet(self) -> Fernet:
+        raw_key = os.getenv(_TOKEN_ENCRYPTION_KEY_ENV, "").strip().strip('"').strip("'")
+        if not raw_key:
+            raise ValueError(
+                f"{_TOKEN_ENCRYPTION_KEY_ENV} не найден. "
+                "Сгенерируй ключ Fernet и добавь его в .env."
+            )
+        try:
+            return Fernet(raw_key.encode("utf-8"))
+        except Exception as exc:
+            raise ValueError(
+                f"{_TOKEN_ENCRYPTION_KEY_ENV} имеет неверный формат. "
+                "Ожидается ключ Fernet (urlsafe base64)."
+            ) from exc
+
+    @staticmethod
+    def _is_encrypted_token(value: str) -> bool:
+        return value.startswith(_TOKEN_PREFIX)
+
+    def _encrypt_token(self, token: str) -> str:
+        encrypted = self._fernet.encrypt(token.encode("utf-8")).decode("utf-8")
+        return f"{_TOKEN_PREFIX}{encrypted}"
+
+    def _decrypt_token(self, value: str) -> str:
+        if not self._is_encrypted_token(value):
+            return value
+        payload = value[len(_TOKEN_PREFIX) :]
+        try:
+            return self._fernet.decrypt(payload.encode("utf-8")).decode("utf-8")
+        except InvalidToken as exc:
+            raise ValueError(
+                "Не удалось расшифровать MAX токен. Проверь TOKEN_ENCRYPTION_KEY."
+            ) from exc
+
+    def _migrate_plaintext_tokens(self) -> None:
+        now = int(time.time())
+        updates: list[tuple[str, int, int]] = []
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT tg_user_id, max_token FROM users WHERE max_token IS NOT NULL AND max_token != ''"
+            ).fetchall()
+            for row in rows:
+                tg_user_id = int(row["tg_user_id"])
+                raw = str(row["max_token"] or "").strip()
+                if not raw:
+                    continue
+                if self._is_encrypted_token(raw):
+                    # Validate existing encrypted tokens on startup.
+                    self._decrypt_token(raw)
+                    continue
+                updates.append((self._encrypt_token(raw), now, tg_user_id))
+
+            if updates:
+                conn.executemany(
+                    "UPDATE users SET max_token = ?, updated_at = ? WHERE tg_user_id = ?",
+                    updates,
+                )
+            conn.commit()
+
+        if updates:
+            logger.info("Migrated %s plaintext MAX token(s) to encrypted storage", len(updates))
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -83,9 +151,17 @@ class UserStore:
             ).fetchone()
         if not row:
             return None
-        return row[0]
+        raw = str(row[0] or "").strip()
+        if not raw:
+            return None
+        token = self._decrypt_token(raw).strip()
+        if token and not self._is_encrypted_token(raw):
+            self.set_token(tg_user_id, token)
+        return token or None
 
     def set_token(self, tg_user_id: int, token: str) -> None:
+        clean_token = (token or "").strip()
+        encrypted_token = self._encrypt_token(clean_token)
         now = int(time.time())
         with self._connect() as conn:
             conn.execute(
@@ -96,7 +172,7 @@ class UserStore:
                     max_token=excluded.max_token,
                     updated_at=excluded.updated_at
                 """,
-                (tg_user_id, token, now, now),
+                (tg_user_id, encrypted_token, now, now),
             )
             conn.commit()
 

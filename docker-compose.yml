@@ -1,0 +1,13 @@
+services:
+  max_bridge_bot:
+    build: .
+    container_name: max_tg_bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Пробрасываем папку с сессиями, чтобы авторизация не слетала при перезапуске
+      - ./sessions:/app/sessions
+    # Опционально: указываем таймзону (полезно для логов)
+    environment:
+      - TZ=Europe/Yekaterinburg

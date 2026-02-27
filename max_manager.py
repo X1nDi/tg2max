@@ -242,45 +242,6 @@ class MaxSessionManager:
         for _, auth_ctx in auth_items:
             await self._hard_close_client(auth_ctx.client)
 
-    async def begin_phone_login(self, tg_user_id: int, phone: str) -> str:
-        lock = self._get_lock(tg_user_id)
-        async with lock:
-            await self._clear_auth_context_locked(tg_user_id)
-            self._reset_auth_session_cache(tg_user_id)
-            auth_client = await self._create_auth_client(phone, self._auth_session_dir(tg_user_id))
-
-            try:
-                temp_token = await auth_client.request_code(phone)
-                if not temp_token:
-                    raise ValueError("MAX не вернул временный токен для подтверждения кода.")
-            except Exception as exc:
-                await self._hard_close_client(auth_client)
-                raise ValueError(self._humanize_auth_flow_error(exc)) from exc
-
-            self._auth_contexts[tg_user_id] = _AuthContext(
-                kind="phone",
-                client=auth_client,
-                phone=phone,
-                temp_token=temp_token,
-            )
-            return phone
-
-    async def complete_phone_login(self, tg_user_id: int, code: str) -> str:
-        lock = self._get_lock(tg_user_id)
-        async with lock:
-            auth_ctx = self._auth_contexts.get(tg_user_id)
-            if auth_ctx is None or auth_ctx.kind != "phone" or not auth_ctx.temp_token:
-                raise ValueError("Сначала выбери вход по телефону и запроси код.")
-
-            try:
-                payload = await auth_ctx.client._send_code(code=code, token=auth_ctx.temp_token)
-                token = self._extract_login_token(payload)
-            except Exception as exc:
-                raise ValueError(self._humanize_auth_flow_error(exc)) from exc
-
-            await self._clear_auth_context_locked(tg_user_id)
-            return token
-
     async def begin_qr_login(self, tg_user_id: int) -> dict[str, str | int]:
         lock = self._get_lock(tg_user_id)
         async with lock:
@@ -360,6 +321,21 @@ class MaxSessionManager:
         lock = self._get_lock(tg_user_id)
         async with lock:
             await self._clear_auth_context_locked(tg_user_id)
+
+    async def logout(self, tg_user_id: int) -> None:
+        lock = self._get_lock(tg_user_id)
+        async with lock:
+            ctx = self._contexts.pop(tg_user_id, None)
+            if ctx:
+                try:
+                    await ctx.client.logout()
+                except Exception as exc:
+                    logger.warning("MAX logout request failed for %s: %s", tg_user_id, exc)
+                await self._stop_context(ctx)
+
+            await self._clear_auth_context_locked(tg_user_id)
+            self.store.clear_token(tg_user_id)
+            self._reset_session_cache(tg_user_id)
 
     async def _stop_context(self, ctx: _ClientContext) -> None:
         await self._hard_close_client(ctx.client)
@@ -472,3 +448,4 @@ class MaxSessionManager:
         if "timeout" in lowered or "send and wait failed" in lowered:
             return "Не удалось связаться с MAX (таймаут/сеть). Попробуй еще раз."
         return f"Ошибка авторизации в MAX: {text}"
+

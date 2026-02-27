@@ -10,4 +10,4 @@ services:
       - ./sessions:/app/sessions
     # Опционально: указываем таймзону (полезно для логов)
     environment:
-      - TZ=Europe/Yekaterinburg
+      - TZ=Asia/Yekaterinburg

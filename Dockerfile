@@ -9,6 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY max_manager.py bot.py ./
+COPY instruction.png ./
 RUN mkdir -p sessions
 
 CMD ["python", "bot.py"]

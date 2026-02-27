@@ -1,5 +1,6 @@
-import asyncio
+﻿import asyncio
 import contextlib
+import ast
 import html
 import json
 import logging
@@ -20,6 +21,9 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from pymax.files import File as MaxFile
+from pymax.files import Photo as MaxPhoto
+from pymax.files import Video as MaxVideo
 
 from max_manager import MaxSessionManager
 
@@ -41,8 +45,11 @@ MEDIA_LINK_TTL_SECONDS = 1800
 UPDATE_POLL_CHAT_LIMIT = 12
 UPDATE_HISTORY_BACKWARD = 20
 TOKEN_REGEX = re.compile(r"An_[A-Za-z0-9._\\-]+")
-PHONE_INPUT_REGEX = re.compile(r"^\+?\d{10,15}$")
 MEDIA_CMD_REGEX = re.compile(r"^/media_([A-Za-z0-9]+)$")
+PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_INSTRUCTION_IMAGE_PATH = os.path.join(BASE_DIR, "instruction.png")
+TOKEN_INSTRUCTION_PHOTO_FILE_ID: str | None = None
 
 try:
     UPDATE_POLL_SECONDS = max(3, int(os.getenv("UPDATE_POLL_SECONDS", "10").strip()))
@@ -67,8 +74,6 @@ session_manager = MaxSessionManager(db_path="sessions/users.db")
 
 class UserFlow(StatesGroup):
     waiting_for_token = State()
-    waiting_for_auth_phone = State()
-    waiting_for_auth_code = State()
     waiting_for_chat_message = State()
 
 
@@ -114,22 +119,41 @@ def normalize_token_input(raw: str) -> str | None:
     if not source:
         return None
 
+    if source.startswith("```") and source.endswith("```"):
+        code_block = source[3:-3].strip()
+        code_lines = code_block.splitlines()
+        if len(code_lines) > 1 and code_lines[0].strip().lower() in {"json", "js", "javascript"}:
+            source = "\n".join(code_lines[1:]).strip()
+        else:
+            source = code_block
+
     if source.lower().startswith("bearer "):
         source = source[7:].strip()
 
     if len(source) >= 2 and source[0] == source[-1] and source[0] in {"'", '"', "`"}:
         source = source[1:-1].strip()
 
+    def _extract_mapping_token(payload: Any) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        for key in ("token", "user_token", "auth_token", "access_token"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
     try:
-        payload = json.loads(source)
-        if isinstance(payload, dict):
-            for key in ("token", "user_token", "auth_token", "access_token"):
-                value = payload.get(key)
-                if isinstance(value, str) and value.strip():
-                    source = value.strip()
-                    break
+        extracted = _extract_mapping_token(json.loads(source))
+        if extracted:
+            source = extracted
     except json.JSONDecodeError:
         pass
+
+    if source.startswith("{") and source.endswith("}"):
+        with contextlib.suppress(Exception):
+            extracted = _extract_mapping_token(ast.literal_eval(source))
+            if extracted:
+                source = extracted
 
     kv_match = re.search(
         r"(?:token|user_token|auth_token|access_token)\s*[:=]\s*[\"']?([^\"'\s,}]+)",
@@ -144,28 +168,6 @@ def normalize_token_input(raw: str) -> str | None:
         return token_match.group(0).strip()
 
     return source.strip() or None
-
-
-def normalize_phone_input(raw: str) -> str | None:
-    source = (raw or "").strip()
-    if not source:
-        return None
-
-    digits = re.sub(r"\D", "", source)
-    if digits.startswith("8") and len(digits) == 11:
-        digits = f"7{digits[1:]}"
-
-    phone = f"+{digits}" if digits else ""
-    if not PHONE_INPUT_REGEX.match(phone):
-        return None
-    return phone
-
-
-def mask_phone(phone: str) -> str:
-    clean = (phone or "").strip()
-    if len(clean) <= 5:
-        return clean
-    return f"{clean[:3]}***{clean[-2:]}"
 
 
 def make_link(url: str, label: str) -> str:
@@ -259,6 +261,63 @@ async def ensure_bot_username() -> str:
     return BOT_USERNAME
 
 
+async def download_telegram_file_to_temp(
+    file_id: str,
+    filename_hint: str,
+) -> str:
+    file_data = await bot.get_file(file_id)
+    file_path = str(getattr(file_data, "file_path", "") or "").strip()
+    if not file_path:
+        raise ValueError("Telegram did not return file path")
+
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    file_name = os.path.basename(file_path) or filename_hint
+    return await download_media_to_temp(file_url, file_name)
+
+
+async def build_max_attachment_from_message(
+    message: types.Message,
+) -> tuple[MaxPhoto | MaxVideo | MaxFile | None, str | None]:
+    if message.photo:
+        photo = message.photo[-1]
+        path = await download_telegram_file_to_temp(photo.file_id, "photo.jpg")
+        return MaxPhoto(path=path), path
+
+    if message.video:
+        file_name = str(getattr(message.video, "file_name", "") or "video.mp4")
+        path = await download_telegram_file_to_temp(message.video.file_id, file_name)
+        return MaxVideo(path=path), path
+
+    if message.animation:
+        file_name = str(getattr(message.animation, "file_name", "") or "animation.mp4")
+        path = await download_telegram_file_to_temp(message.animation.file_id, file_name)
+        return MaxVideo(path=path), path
+
+    if message.document:
+        doc = message.document
+        file_name = str(getattr(doc, "file_name", "") or "document.bin")
+        mime_type = str(getattr(doc, "mime_type", "") or "").lower()
+        ext = os.path.splitext(file_name)[1].lower()
+        path = await download_telegram_file_to_temp(doc.file_id, file_name)
+
+        if mime_type.startswith("image/") and ext in PHOTO_EXTENSIONS:
+            return MaxPhoto(path=path), path
+        if mime_type.startswith("video/"):
+            return MaxVideo(path=path), path
+        return MaxFile(path=path), path
+
+    if message.audio:
+        file_name = str(getattr(message.audio, "file_name", "") or "audio.mp3")
+        path = await download_telegram_file_to_temp(message.audio.file_id, file_name)
+        return MaxFile(path=path), path
+
+    if message.voice:
+        path = await download_telegram_file_to_temp(message.voice.file_id, "voice.ogg")
+        return MaxFile(path=path), path
+
+    return None, None
+
+
 def normalize_chat_type(chat_type: Any) -> str:
     value = getattr(chat_type, "value", chat_type)
     return str(value or "CHAT")
@@ -315,27 +374,50 @@ def short_title(title: str, max_len: int = 32) -> str:
 
 
 def main_menu_keyboard(has_token: bool) -> InlineKeyboardMarkup:
-    token_text = "🔑 Обновить MAX токен" if has_token else "🔑 Подключить MAX токен"
-    rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(text=token_text, callback_data="token:set")],
-        [InlineKeyboardButton(text="🔐 Выбрать способ входа", callback_data="auth:menu")],
+    if not has_token:
+        rows: list[list[InlineKeyboardButton]] = [
+            [InlineKeyboardButton(text="🔐 Войти в MAX", callback_data="auth:menu")],
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    rows = [
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile:me")],
         [InlineKeyboardButton(text="💬 Мои чаты", callback_data="chats:0")],
     ]
-    if has_token:
-        rows.insert(0, [InlineKeyboardButton(text="✅ MAX подключен", callback_data="token:info")])
-
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def auth_methods_keyboard(has_token: bool) -> InlineKeyboardMarkup:
-    token_text = "🔑 Обновить MAX токен" if has_token else "🔑 Войти по токену"
+    token_text = (
+        "🔑 Обновить MAX токен (Самый рабочий)"
+        if has_token
+        else "🔑 Войти по токену (Самый рабочий)"
+    )
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text=token_text, callback_data="auth:token")],
-        [InlineKeyboardButton(text="📱 Войти по телефону", callback_data="auth:phone")],
         [InlineKeyboardButton(text="🧩 Войти через QR", callback_data="auth:qr")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def self_profile_keyboard(has_token: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_token:
+        rows.append([InlineKeyboardButton(text="🚪 Выйти", callback_data="logout:confirm")])
+    else:
+        rows.append([InlineKeyboardButton(text="🔐 Войти в MAX", callback_data="auth:menu")])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def logout_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, выйти", callback_data="logout:yes")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="logout:cancel")],
+        ]
+    )
 
 
 def cancel_flow_keyboard() -> InlineKeyboardMarkup:
@@ -356,9 +438,18 @@ def auth_menu_text(has_token: bool) -> str:
         "<b>Авторизация MAX</b>\n"
         f"Текущий статус: <b>{status}</b>\n\n"
         "Выбери способ входа:\n"
-        "• токен\n"
-        "• телефон + код\n"
+        "• токен <u>(Самый рабочий)</u>\n"
         "• QR-код"
+    )
+
+
+def main_menu_text(has_token: bool, name: str) -> str:
+    status = "подключен ✅" if has_token else "не подключен ❌"
+    return (
+        "<b>Tg2max</b>\n"
+        f"Привет, <b>{esc(name)}</b>.\n\n"
+        f"Статус MAX: <b>{status}</b>\n"
+        "Выбери действие:"
     )
 
 
@@ -371,17 +462,91 @@ def token_help_text() -> str:
         "3. Найди значение токена (<code>token</code> или <code>user_token</code>).\n"
         "4. Отправь токен сюда одним сообщением.\n"
         "\n"
+        "Можно отправить:\n"
+        "• токен в чистом виде\n"
+        "• JSON, например: <code>{\"token\":\"...\",\"viewerId\":94350134}</code>\n"
+        "<i>Я сам извлеку поле token.</i>\n"
+        "\n"
         "<i>Токен сохранится только для твоего Telegram ID.</i>"
     )
 
 
-def phone_help_text() -> str:
-    return (
-        "<b>Вход по телефону</b>\n\n"
-        "Отправь номер в международном формате:\n"
-        "<code>+79991234567</code>\n\n"
-        "<i>После этого бот запросит код подтверждения из MAX.</i>"
-    )
+async def send_token_instructions(message: types.Message) -> list[int]:
+    global TOKEN_INSTRUCTION_PHOTO_FILE_ID
+    sent_ids: list[int] = []
+
+    if TOKEN_INSTRUCTION_PHOTO_FILE_ID:
+        try:
+            sent_photo = await message.answer_photo(
+                photo=TOKEN_INSTRUCTION_PHOTO_FILE_ID,
+                caption="Инструкция на скриншоте.",
+            )
+            sent_ids.append(sent_photo.message_id)
+        except Exception as exc:
+            logger.warning(
+                "Failed to send cached token instruction image %s: %s",
+                TOKEN_INSTRUCTION_PHOTO_FILE_ID,
+                exc,
+            )
+            TOKEN_INSTRUCTION_PHOTO_FILE_ID = None
+
+    photo_candidates = [TOKEN_INSTRUCTION_IMAGE_PATH, "instruction.png"]
+    seen_paths: set[str] = set()
+    if not sent_ids:
+        for candidate in photo_candidates:
+            full_path = os.path.abspath(candidate)
+            if full_path in seen_paths:
+                continue
+            seen_paths.add(full_path)
+            if not os.path.isfile(full_path):
+                continue
+
+            try:
+                sent_photo = await message.answer_photo(
+                    photo=FSInputFile(full_path),
+                    caption="Инструкция на скриншоте.",
+                )
+                sent_ids.append(sent_photo.message_id)
+                photo_sizes = getattr(sent_photo, "photo", None) or []
+                if photo_sizes:
+                    file_id = getattr(photo_sizes[-1], "file_id", None)
+                    if isinstance(file_id, str) and file_id:
+                        TOKEN_INSTRUCTION_PHOTO_FILE_ID = file_id
+                break
+            except Exception as exc:
+                logger.warning("Failed to send token instruction image %s: %s", full_path, exc)
+
+    sent_text = await message.answer(token_help_text(), reply_markup=cancel_flow_keyboard())
+    sent_ids.append(sent_text.message_id)
+    return sent_ids
+
+
+async def cleanup_auth_instruction_messages(
+    state: FSMContext,
+    chat_id: int,
+) -> None:
+    data = await state.get_data()
+    raw_ids = data.get("auth_instruction_message_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return
+
+    unique_ids: list[int] = []
+    seen: set[int] = set()
+    for item in raw_ids:
+        try:
+            mid = int(item)
+        except (TypeError, ValueError):
+            continue
+        if mid <= 0 or mid in seen:
+            continue
+        seen.add(mid)
+        unique_ids.append(mid)
+
+    for message_id in unique_ids:
+        with contextlib.suppress(Exception):
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+
+    await state.update_data(auth_instruction_message_ids=[])
 
 
 def qr_help_text(qr_link: str, expires_at: int) -> str:
@@ -401,8 +566,7 @@ def qr_auth_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Проверить QR", callback_data="auth:qr:check")],
             [InlineKeyboardButton(text="🔁 Обновить QR", callback_data="auth:qr:refresh")],
-            [InlineKeyboardButton(text="⬅️ К способам входа", callback_data="auth:menu")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
+            [InlineKeyboardButton(text="✖️ Отменить", callback_data="auth:menu")],
         ]
     )
 
@@ -489,24 +653,26 @@ def build_history_keyboard(
     chat_page: int,
     has_older: bool,
     has_newer: bool,
+    page_step: int,
     show_members: bool,
     profile_user_id: int | None,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    step = max(1, page_step)
 
     nav: list[InlineKeyboardButton] = []
     if has_older:
         nav.append(
             InlineKeyboardButton(
-                text="⬆️ Старее 10",
-                callback_data=f"chat:{chat_id}:{offset + HISTORY_PAGE_SIZE}:{chat_page}",
+                text=f"⬆️ Старее {step}",
+                callback_data=f"chat:{chat_id}:{offset + step}:{chat_page}",
             )
         )
     if has_newer:
         nav.append(
             InlineKeyboardButton(
-                text="⬇️ Новее 10",
-                callback_data=f"chat:{chat_id}:{max(0, offset - HISTORY_PAGE_SIZE)}:{chat_page}",
+                text=f"⬇️ Новее {step}",
+                callback_data=f"chat:{chat_id}:{max(0, offset - step)}:{chat_page}",
             )
         )
     if nav:
@@ -544,9 +710,29 @@ async def safe_edit_message(
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
     try:
-        await message.edit_text(text=text, reply_markup=reply_markup)
+        if getattr(message, "photo", None) or getattr(message, "video", None):
+            await message.edit_caption(caption=text, reply_markup=reply_markup)
+        else:
+            await message.edit_text(text=text, reply_markup=reply_markup)
     except TelegramBadRequest:
         await message.answer(text=text, reply_markup=reply_markup)
+
+
+async def edit_message_no_fallback(
+    message: types.Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    try:
+        if getattr(message, "photo", None) or getattr(message, "video", None):
+            await message.edit_caption(caption=text, reply_markup=reply_markup)
+        else:
+            await message.edit_text(text=text, reply_markup=reply_markup)
+    except TelegramBadRequest as exc:
+        lowered = str(exc).lower()
+        if "message is not modified" in lowered:
+            return
+        logger.debug("Skip message edit without fallback: %s", exc)
 
 
 def remember_user(user: types.User) -> None:
@@ -556,6 +742,19 @@ def remember_user(user: types.User) -> None:
         first_name=user.first_name,
         last_name=user.last_name,
     )
+
+
+def clear_user_runtime_cache(tg_user_id: int) -> None:
+    CHAT_CACHE.pop(tg_user_id, None)
+    media_keys = [key for key, item in MEDIA_CACHE.items() if item.tg_user_id == tg_user_id]
+    for key in media_keys:
+        MEDIA_CACHE.pop(key, None)
+    anchor_keys = [key for key in HISTORY_ANCHORS if key[0] == tg_user_id]
+    for key in anchor_keys:
+        HISTORY_ANCHORS.pop(key, None)
+    seen_keys = [key for key in UPDATE_LAST_SEEN if key[0] == tg_user_id]
+    for key in seen_keys:
+        UPDATE_LAST_SEEN.pop(key, None)
 
 
 async def get_chat_entries(
@@ -709,6 +908,34 @@ def render_user_profile_text(user: Any, user_id: int) -> tuple[str, str]:
         lines.append("Номер: <i>скрыт</i>")
     if username:
         lines.append(f"Username: <code>{esc(username)}</code>")
+    if link.startswith(("http://", "https://")):
+        lines.append(f"Профиль в MAX: {make_link(link, 'открыть')}")
+
+    return "\n".join(lines), avatar
+
+
+def render_self_profile_text(user: Any, me: Any) -> tuple[str, str]:
+    me_id = parse_int(str(getattr(me, "id", 0)), default=0)
+    name = user_display_name(user or me, "Пользователь")
+    description = str(getattr(user, "description", "") or "").strip()
+    phone = str(getattr(me, "phone", "") or "").strip()
+    link = str(getattr(user, "link", "") or "").strip()
+    avatar_url = str(getattr(user, "base_url", "") or "").strip()
+    avatar_raw = str(getattr(user, "base_raw_url", "") or "").strip()
+    avatar = avatar_url or avatar_raw
+
+    lines = [
+        "<b>Твой профиль MAX</b>",
+        f"Имя: <b>{esc(name)}</b>",
+    ]
+    if me_id:
+        lines.append(f"MAX ID: <code>{esc(me_id)}</code>")
+    if description:
+        lines.append(f"Описание: {esc(description)}")
+    if phone:
+        lines.append(f"Номер: <code>{esc(phone)}</code>")
+    else:
+        lines.append("Номер: <i>скрыт</i>")
     if link.startswith(("http://", "https://")):
         lines.append(f"Профиль в MAX: {make_link(link, 'открыть')}")
 
@@ -873,7 +1100,6 @@ async def build_history_text(
     end_index = max(0, total_messages - offset)
     start_index = max(0, end_index - HISTORY_PAGE_SIZE)
     page_messages = ordered[start_index:end_index]
-    has_more = start_index > 0
     has_newer = offset > 0
 
     entries = await get_chat_entries(tg_user_id, client)
@@ -950,21 +1176,30 @@ async def build_history_text(
         if not body and not attachment_lines and not (msg.link and msg.link.message):
             block_lines.append("<i>[Пустое сообщение]</i>")
 
-        rendered_blocks.append("<blockquote>" + "\n".join(block_lines) + "</blockquote>")
+        rendered_blocks.append("<blockquote expandable>" + "\n".join(block_lines) + "</blockquote>")
 
-    body_parts: list[str] = []
-    body_length = 0
     separator = "\n\n"
-    for block in rendered_blocks:
-        extra = len(block) + (len(separator) if body_parts else 0)
-        if body_length + extra > 3600:
-            body_parts.append("<i>… часть истории скрыта из-за лимита Telegram</i>")
+    max_body_len = 3600
+    selected_rev: list[str] = []
+    selected_len = 0
+    for block in reversed(rendered_blocks):
+        extra = len(block) + (len(separator) if selected_rev else 0)
+        if selected_len + extra > max_body_len and selected_rev:
             break
-        if body_parts:
-            body_parts.append(separator)
-            body_length += len(separator)
-        body_parts.append(block)
-        body_length += len(block)
+        if selected_len + extra > max_body_len and not selected_rev:
+            cut = max(200, max_body_len - 80)
+            trimmed = block[:cut] + "\n<i>…сообщение обрезано из-за лимита Telegram</i>"
+            selected_rev.append(trimmed)
+            selected_len = len(trimmed)
+            break
+        selected_rev.append(block)
+        selected_len += extra
+
+    selected_blocks = list(reversed(selected_rev))
+    shown_count = len(selected_blocks)
+    hidden_due_limit = max(0, len(rendered_blocks) - shown_count)
+    has_more = start_index > 0 or hidden_due_limit > 0
+    page_step = shown_count if shown_count > 0 else 1
 
     if not page_messages:
         content = (
@@ -972,12 +1207,18 @@ async def build_history_text(
             f"<i>В этом чате пока нет сообщений.</i>"
         )
     else:
-        start_no = start_index + 1
+        start_no = end_index - shown_count + 1
         end_no = end_index
+        range_note = (
+            f"<i>Сообщения {start_no}-{end_no} из {total_messages}. Новые внизу.</i>"
+            if hidden_due_limit == 0
+            else f"<i>Сообщения {start_no}-{end_no} из {total_messages}. "
+            "Показаны самые новые, остальное через «Старее».</i>"
+        )
         content = (
             f"💬 <b>{esc(chat_title)}</b>\n"
-            f"<i>Сообщения {start_no}-{end_no} из {total_messages}. Новые внизу.</i>\n\n"
-            f"{''.join(body_parts)}"
+            f"{range_note}\n\n"
+            f"{separator.join(selected_blocks)}"
         )
 
     keyboard = build_history_keyboard(
@@ -986,6 +1227,7 @@ async def build_history_text(
         chat_page=chat_page,
         has_older=has_more,
         has_newer=has_newer,
+        page_step=page_step,
         show_members=show_members,
         profile_user_id=profile_user_id,
     )
@@ -1011,6 +1253,7 @@ async def send_media_by_token(message: types.Message, token: str) -> None:
 
     caption = "Медиа из MAX"
     kind = request.kind.upper()
+    fallback_url = request.url
     try:
         if kind == "PHOTO":
             if request.url:
@@ -1049,6 +1292,7 @@ async def send_media_by_token(message: types.Message, token: str) -> None:
             url = getattr(file_req, "url", None)
             if not isinstance(url, str) or not url:
                 raise ValueError("MAX не вернул ссылку на файл")
+            fallback_url = url
             try:
                 await message.answer_document(
                     document=url,
@@ -1079,30 +1323,59 @@ async def send_media_by_token(message: types.Message, token: str) -> None:
                 message_id=request.message_id,
                 video_id=request.video_id,
             )
+            candidates: list[str] = []
             url = getattr(video_req, "url", None)
-            if not isinstance(url, str) or not url:
+            if isinstance(url, str) and url:
+                candidates.append(url)
+            external = getattr(video_req, "external", None)
+            if isinstance(external, str) and external.startswith(("http://", "https://")):
+                if external not in candidates:
+                    candidates.append(external)
+
+            if not candidates:
                 raise ValueError("MAX не вернул ссылку на видео")
-            try:
-                await message.answer_video(
-                    video=url,
-                    caption=caption,
-                    reply_markup=dismiss_message_keyboard(),
-                )
-            except TelegramBadRequest as exc:
-                if not is_telegram_url_fetch_error(exc):
-                    raise
-                file_name = _filename_from_url(url, "video.mp4")
-                path = await download_media_to_temp(url, file_name)
+            last_error: Exception | None = None
+            for candidate in candidates:
+                fallback_url = candidate
                 try:
                     await message.answer_video(
-                        video=FSInputFile(path),
+                        video=candidate,
                         caption=caption,
                         reply_markup=dismiss_message_keyboard(),
                     )
-                finally:
-                    with contextlib.suppress(Exception):
-                        os.remove(path)
-            return
+                    return
+                except TelegramBadRequest as exc:
+                    last_error = exc
+                    if not is_telegram_url_fetch_error(exc):
+                        continue
+
+                    file_name = _filename_from_url(candidate, "video.mp4")
+                    path = await download_media_to_temp(candidate, file_name)
+                    try:
+                        try:
+                            await message.answer_video(
+                                video=FSInputFile(path, filename=file_name),
+                                caption=caption,
+                                reply_markup=dismiss_message_keyboard(),
+                            )
+                            return
+                        except TelegramBadRequest:
+                            await message.answer_document(
+                                document=FSInputFile(path, filename=file_name),
+                                caption=caption,
+                                reply_markup=dismiss_message_keyboard(),
+                            )
+                            return
+                    finally:
+                        with contextlib.suppress(Exception):
+                            os.remove(path)
+                except Exception as exc:
+                    last_error = exc
+                    continue
+
+            if last_error:
+                raise last_error
+            raise ValueError("Не удалось отправить видео")
 
         if kind == "AUDIO":
             if not request.url:
@@ -1156,7 +1429,7 @@ async def send_media_by_token(message: types.Message, token: str) -> None:
         await message.answer("Этот тип вложения пока не поддержан для выдачи.")
     except Exception as exc:
         logger.warning("Failed to send media by token %s: %s", token, exc)
-        fallback = request.url
+        fallback = fallback_url
         if fallback:
             await message.answer(
                 "Не удалось отправить как файл. Открой прямую ссылку:\n"
@@ -1259,7 +1532,11 @@ async def poll_updates_for_user(tg_user_id: int) -> None:
                 f"{esc(body)}"
             )
             try:
-                await bot.send_message(chat_id=tg_user_id, text=notify_text)
+                await bot.send_message(
+                    chat_id=tg_user_id,
+                    text=notify_text,
+                    reply_markup=dismiss_message_keyboard(),
+                )
             except Exception as exc:
                 logger.debug("Could not deliver update to tg=%s: %s", tg_user_id, exc)
 
@@ -1302,15 +1579,7 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
     name = " ".join(
         part for part in [message.from_user.first_name, message.from_user.last_name] if part
     ).strip() or "друг"
-    token_status = "подключен ✅" if has_token else "не подключен ❌"
-
-    text = (
-        f"<b>MAX Bridge</b>\n"
-        f"Привет, <b>{esc(name)}</b>.\n\n"
-        f"Текущий статус MAX: <b>{token_status}</b>.\n"
-        f"Выбери действие в меню ниже."
-    )
-    await message.answer(text, reply_markup=main_menu_keyboard(has_token))
+    await message.answer(main_menu_text(has_token, name), reply_markup=main_menu_keyboard(has_token))
 
 
 @dp.message(Command("menu"))
@@ -1319,7 +1588,10 @@ async def cmd_menu(message: types.Message, state: FSMContext) -> None:
     await session_manager.clear_auth_flow(message.from_user.id)
     await state.clear()
     has_token = session_manager.has_token(message.from_user.id)
-    await message.answer("<b>Главное меню</b>", reply_markup=main_menu_keyboard(has_token))
+    name = " ".join(
+        part for part in [message.from_user.first_name, message.from_user.last_name] if part
+    ).strip() or "друг"
+    await message.answer(main_menu_text(has_token, name), reply_markup=main_menu_keyboard(has_token))
 
 
 @dp.message(Command("login"))
@@ -1347,8 +1619,146 @@ async def cb_menu_main(callback: types.CallbackQuery, state: FSMContext) -> None
     await session_manager.clear_auth_flow(callback.from_user.id)
     await state.clear()
     has_token = session_manager.has_token(callback.from_user.id)
-    await safe_edit_message(callback.message, "<b>Главное меню</b>", main_menu_keyboard(has_token))
+    name = " ".join(
+        part for part in [callback.from_user.first_name, callback.from_user.last_name] if part
+    ).strip() or "друг"
+    text = main_menu_text(has_token, name)
+    keyboard = main_menu_keyboard(has_token)
+    if getattr(callback.message, "photo", None) or getattr(callback.message, "video", None):
+        with contextlib.suppress(Exception):
+            await callback.message.delete()
+        await callback.message.answer(text, reply_markup=keyboard)
+    else:
+        await safe_edit_message(callback.message, text, keyboard)
     await callback.answer()
+
+
+@dp.callback_query(F.data == "profile:me")
+async def cb_profile_me(callback: types.CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user:
+        remember_user(callback.from_user)
+    await session_manager.clear_auth_flow(callback.from_user.id)
+    await state.clear()
+
+    has_token = session_manager.has_token(callback.from_user.id)
+    if not has_token:
+        name = " ".join(
+            part for part in [callback.from_user.first_name, callback.from_user.last_name] if part
+        ).strip() or "друг"
+        text = (
+            "<b>Твой профиль</b>\n"
+            f"Telegram: <b>{esc(name)}</b>\n"
+            "MAX: <b>не подключен ❌</b>\n\n"
+            "Нажми «Войти в MAX», чтобы подключить аккаунт."
+        )
+        await safe_edit_message(callback.message, text, self_profile_keyboard(False))
+        await callback.answer()
+        return
+
+    try:
+        client = await session_manager.ensure_client(callback.from_user.id)
+        me = getattr(client, "me", None)
+        if me is None:
+            raise ValueError("Не удалось получить профиль MAX")
+
+        me_id = parse_int(str(getattr(me, "id", 0)), default=0)
+        profile = None
+        if me_id:
+            users = await client.get_users([me_id])
+            profile = users[0] if users else None
+
+        text, avatar = render_self_profile_text(profile, me)
+        await show_profile_card(
+            source_message=callback.message,
+            text=text,
+            keyboard=self_profile_keyboard(True),
+            avatar=avatar,
+        )
+        await callback.answer()
+    except Exception as exc:
+        logger.exception("Failed to open self profile for %s", callback.from_user.id)
+        await callback.answer("Ошибка загрузки профиля", show_alert=True)
+        await callback.message.answer(f"Не удалось открыть профиль: <code>{esc(exc)}</code>")
+
+
+@dp.callback_query(F.data == "logout:confirm")
+async def cb_logout_confirm(callback: types.CallbackQuery) -> None:
+    if callback.from_user:
+        remember_user(callback.from_user)
+    await safe_edit_message(
+        callback.message,
+        "<b>Выход из MAX</b>\n\nПодтвердить выход из аккаунта?",
+        logout_confirm_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "logout:cancel")
+async def cb_logout_cancel(callback: types.CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user:
+        remember_user(callback.from_user)
+    await session_manager.clear_auth_flow(callback.from_user.id)
+    await state.clear()
+
+    has_token = session_manager.has_token(callback.from_user.id)
+    if not has_token:
+        name = " ".join(
+            part for part in [callback.from_user.first_name, callback.from_user.last_name] if part
+        ).strip() or "друг"
+        text = (
+            "<b>Твой профиль</b>\n"
+            f"Telegram: <b>{esc(name)}</b>\n"
+            "MAX: <b>не подключен ❌</b>\n\n"
+            "Нажми «Войти в MAX», чтобы подключить аккаунт."
+        )
+        await safe_edit_message(callback.message, text, self_profile_keyboard(False))
+        await callback.answer()
+        return
+
+    try:
+        client = await session_manager.ensure_client(callback.from_user.id)
+        me = getattr(client, "me", None)
+        if me is None:
+            raise ValueError("Не удалось получить профиль MAX")
+
+        me_id = parse_int(str(getattr(me, "id", 0)), default=0)
+        profile = None
+        if me_id:
+            users = await client.get_users([me_id])
+            profile = users[0] if users else None
+
+        text, _ = render_self_profile_text(profile, me)
+        await safe_edit_message(
+            callback.message,
+            text,
+            self_profile_keyboard(True),
+        )
+        await callback.answer()
+    except Exception:
+        logger.exception("Failed to return to self profile on logout cancel for %s", callback.from_user.id)
+        await callback.answer("Ошибка, попробуйте позже", show_alert=True)
+
+
+@dp.callback_query(F.data == "logout:yes")
+async def cb_logout_yes(callback: types.CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user:
+        remember_user(callback.from_user)
+    await state.clear()
+    await session_manager.clear_auth_flow(callback.from_user.id)
+
+    try:
+        await session_manager.logout(callback.from_user.id)
+    except Exception as exc:
+        logger.warning("MAX logout failed for %s: %s", callback.from_user.id, exc)
+
+    clear_user_runtime_cache(callback.from_user.id)
+
+    await safe_edit_message(
+        callback.message,
+        "✅ Ты вышел из MAX. Можно подключить аккаунт снова в профиле.",
+        main_menu_keyboard(False),
+    )
+    await callback.answer("Выход выполнен")
 
 
 @dp.callback_query(F.data == "token:info")
@@ -1379,20 +1789,14 @@ async def cb_auth_menu(callback: types.CallbackQuery, state: FSMContext) -> None
 async def cb_auth_token(callback: types.CallbackQuery, state: FSMContext) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.answer()
     await session_manager.clear_auth_flow(callback.from_user.id)
     await state.set_state(UserFlow.waiting_for_token)
-    await callback.message.answer(token_help_text(), reply_markup=cancel_flow_keyboard())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "auth:phone")
-async def cb_auth_phone(callback: types.CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user:
-        remember_user(callback.from_user)
-    await session_manager.clear_auth_flow(callback.from_user.id)
-    await state.set_state(UserFlow.waiting_for_auth_phone)
-    await callback.message.answer(phone_help_text(), reply_markup=cancel_flow_keyboard())
-    await callback.answer()
+    with contextlib.suppress(Exception):
+        await callback.message.delete()
+    sent_ids = await send_token_instructions(callback.message)
+    await state.update_data(auth_instruction_message_ids=sent_ids)
 
 
 @dp.callback_query(F.data == "auth:qr")
@@ -1402,10 +1806,18 @@ async def cb_auth_qr(callback: types.CallbackQuery, state: FSMContext) -> None:
         remember_user(callback.from_user)
     await state.clear()
 
-    wait_message = await callback.message.answer("Генерирую новый QR-код…")
+    if callback.data == "auth:qr":
+        with contextlib.suppress(Exception):
+            await callback.message.delete()
+        wait_message = await callback.message.answer("Генерирую новый QR-код…")
+    else:
+        wait_message = callback.message
+        await edit_message_no_fallback(wait_message, "Генерирую новый QR-код…")
+
     try:
         data = await session_manager.begin_qr_login(callback.from_user.id)
-        await wait_message.edit_text(
+        await edit_message_no_fallback(
+            wait_message,
             qr_help_text(
                 qr_link=str(data["qr_link"]),
                 expires_at=int(data["expires_at"]),
@@ -1413,7 +1825,8 @@ async def cb_auth_qr(callback: types.CallbackQuery, state: FSMContext) -> None:
             reply_markup=qr_auth_keyboard(),
         )
     except Exception as exc:
-        await wait_message.edit_text(
+        await edit_message_no_fallback(
+            wait_message,
             f"❌ {esc(exc)}\n\n"
             "Попробуй снова или выбери другой способ входа.",
             reply_markup=auth_methods_keyboard(session_manager.has_token(callback.from_user.id)),
@@ -1429,7 +1842,8 @@ async def cb_auth_qr_check(callback: types.CallbackQuery, state: FSMContext) -> 
     try:
         status, token = await session_manager.check_qr_login(callback.from_user.id)
     except Exception as exc:
-        await callback.message.answer(
+        await edit_message_no_fallback(
+            callback.message,
             f"❌ {esc(exc)}\n\n"
             "Попробуй обновить QR или выбери другой способ входа.",
             reply_markup=qr_auth_keyboard(),
@@ -1442,7 +1856,8 @@ async def cb_auth_qr_check(callback: types.CallbackQuery, state: FSMContext) -> 
         return
 
     if status == "expired":
-        await callback.message.answer(
+        await edit_message_no_fallback(
+            callback.message,
             "⌛️ Срок QR-кода истек. Нажми «Обновить QR».",
             reply_markup=qr_auth_keyboard(),
         )
@@ -1450,17 +1865,19 @@ async def cb_auth_qr_check(callback: types.CallbackQuery, state: FSMContext) -> 
         return
 
     if status == "ready" and token:
-        wait_message = await callback.message.answer("Подтверждаю вход и сохраняю токен…")
+        await edit_message_no_fallback(callback.message, "Подтверждаю вход и сохраняю токен…")
         try:
             await session_manager.validate_and_save_token(callback.from_user.id, token)
             CHAT_CACHE.pop(callback.from_user.id, None)
             await state.clear()
-            await wait_message.edit_text(
+            await edit_message_no_fallback(
+                callback.message,
                 "✅ MAX успешно подключен через QR.",
                 reply_markup=main_menu_keyboard(True),
             )
         except Exception as exc:
-            await wait_message.edit_text(
+            await edit_message_no_fallback(
+                callback.message,
                 f"❌ {esc(exc)}\n\n"
                 "Попробуй снова или выбери вход по токену.",
                 reply_markup=auth_methods_keyboard(session_manager.has_token(callback.from_user.id)),
@@ -1472,20 +1889,65 @@ async def cb_auth_qr_check(callback: types.CallbackQuery, state: FSMContext) -> 
 async def cb_token_set(callback: types.CallbackQuery, state: FSMContext) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.answer()
     await session_manager.clear_auth_flow(callback.from_user.id)
     await state.set_state(UserFlow.waiting_for_token)
-    await callback.message.answer(token_help_text(), reply_markup=cancel_flow_keyboard())
-    await callback.answer()
+    with contextlib.suppress(Exception):
+        await callback.message.delete()
+    sent_ids = await send_token_instructions(callback.message)
+    await state.update_data(auth_instruction_message_ids=sent_ids)
 
 
 @dp.callback_query(F.data == "flow:cancel")
 async def cb_flow_cancel(callback: types.CallbackQuery, state: FSMContext) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
+    current_state = await state.get_state()
+    is_token_flow = current_state == UserFlow.waiting_for_token.state
+    is_write_flow = current_state == UserFlow.waiting_for_chat_message.state
+
+    if is_write_flow:
+        data = await state.get_data()
+        chat_id = parse_int(str(data.get("chat_id", "0")), default=0)
+        chat_page = max(0, parse_int(str(data.get("chat_page", "0")), default=0))
+        await state.clear()
+        with contextlib.suppress(Exception):
+            await callback.answer("Отменено")
+        if chat_id > 0:
+            try:
+                client = await session_manager.ensure_client(callback.from_user.id)
+                text, keyboard = await build_history_text(
+                    tg_user_id=callback.from_user.id,
+                    client=client,
+                    chat_id=chat_id,
+                    offset=0,
+                    chat_page=chat_page,
+                )
+                await safe_edit_message(callback.message, text, keyboard)
+                return
+            except Exception as exc:
+                logger.warning(
+                    "Failed to restore chat view on cancel for user=%s chat=%s: %s",
+                    callback.from_user.id,
+                    chat_id,
+                    exc,
+                )
+        with contextlib.suppress(Exception):
+            await callback.message.delete()
+        return
+
+    await cleanup_auth_instruction_messages(state, callback.message.chat.id)
     await session_manager.clear_auth_flow(callback.from_user.id)
     await state.clear()
     with contextlib.suppress(Exception):
         await callback.message.delete()
+    if is_token_flow:
+        has_token = session_manager.has_token(callback.from_user.id)
+        await callback.message.answer(
+            auth_menu_text(has_token),
+            reply_markup=auth_methods_keyboard(has_token),
+        )
     await callback.answer("Отменено")
 
 
@@ -1498,79 +1960,17 @@ async def cb_msg_close(callback: types.CallbackQuery) -> None:
     await callback.answer()
 
 
-@dp.message(UserFlow.waiting_for_auth_phone, F.text)
-async def input_auth_phone(message: types.Message, state: FSMContext) -> None:
-    remember_user(message.from_user)
-    phone = normalize_phone_input(message.text or "")
-    if not phone:
-        await message.answer(
-            "Номер не распознан. Используй формат <code>+79991234567</code> и отправь снова."
-        )
-        return
-
-    wait_message = await message.answer("Отправляю код подтверждения в MAX…")
-    try:
-        sent_phone = await session_manager.begin_phone_login(message.from_user.id, phone)
-        await state.set_state(UserFlow.waiting_for_auth_code)
-        await state.update_data(auth_phone=sent_phone)
-        await wait_message.edit_text(
-            f"✅ Код отправлен на <code>{esc(mask_phone(sent_phone))}</code>.\n"
-            "Отправь код одним сообщением (6 цифр).",
-            reply_markup=cancel_flow_keyboard(),
-        )
-    except Exception as exc:
-        await wait_message.edit_text(
-            f"❌ {esc(exc)}\n\n"
-            "Проверь номер и попробуй снова.",
-            reply_markup=cancel_flow_keyboard(),
-        )
-
-
-@dp.message(UserFlow.waiting_for_auth_code, F.text)
-async def input_auth_code(message: types.Message, state: FSMContext) -> None:
-    remember_user(message.from_user)
-    code = re.sub(r"\D", "", message.text or "")
-    if len(code) != 6:
-        await message.answer("Нужен код из 6 цифр. Отправь его без лишнего текста.")
-        return
-
-    wait_message = await message.answer("Проверяю код…")
-    try:
-        token = await session_manager.complete_phone_login(message.from_user.id, code)
-    except Exception as exc:
-        await wait_message.edit_text(
-            f"❌ {esc(exc)}\n\n"
-            "Отправь код повторно.",
-            reply_markup=cancel_flow_keyboard(),
-        )
-        return
-
-    try:
-        await session_manager.validate_and_save_token(message.from_user.id, token)
-        CHAT_CACHE.pop(message.from_user.id, None)
-        await state.clear()
-        await wait_message.edit_text(
-            "✅ MAX успешно подключен по телефону.",
-            reply_markup=main_menu_keyboard(True),
-        )
-    except Exception as exc:
-        await state.clear()
-        await wait_message.edit_text(
-            f"❌ {esc(exc)}\n\n"
-            "Авторизацию по телефону нужно запустить заново.",
-            reply_markup=auth_methods_keyboard(session_manager.has_token(message.from_user.id)),
-        )
-
-
 @dp.message(UserFlow.waiting_for_token, F.text)
 async def input_token(message: types.Message, state: FSMContext) -> None:
     remember_user(message.from_user)
+    await cleanup_auth_instruction_messages(state, message.chat.id)
     await session_manager.clear_auth_flow(message.from_user.id)
     token = normalize_token_input(message.text or "")
 
     if not token or len(token) < 20:
         await message.answer(
-            "Не получилось распознать токен. Отправь только значение токена одной строкой.",
+            "Не получилось распознать токен. Отправь токен строкой или JSON вида "
+            '<code>{"token":"...","viewerId":94350134}</code>.',
             reply_markup=cancel_flow_keyboard(),
         )
         return
@@ -1603,7 +2003,8 @@ async def cb_chats(callback: types.CallbackQuery) -> None:
 
     if not session_manager.has_token(callback.from_user.id):
         await callback.answer("Сначала авторизуйся в MAX", show_alert=True)
-        await callback.message.answer(
+        await safe_edit_message(
+            callback.message,
             auth_menu_text(False),
             reply_markup=auth_methods_keyboard(False),
         )
@@ -1640,8 +2041,7 @@ async def cb_chats(callback: types.CallbackQuery) -> None:
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to load chats for user %s", callback.from_user.id)
-        await callback.answer("Ошибка загрузки чатов", show_alert=True)
-        await callback.message.answer(f"Не удалось загрузить чаты: <code>{esc(exc)}</code>")
+        await callback.answer("Ошибка, попробуйте позже", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("chat:"))
@@ -1675,8 +2075,7 @@ async def cb_chat(callback: types.CallbackQuery) -> None:
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to open chat %s for user %s", chat_id, callback.from_user.id)
-        await callback.answer("Ошибка загрузки сообщений", show_alert=True)
-        await callback.message.answer(f"Не удалось получить сообщения: <code>{esc(exc)}</code>")
+        await callback.answer("Ошибка, попробуйте позже", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("profile:"))
@@ -1716,8 +2115,7 @@ async def cb_profile_from_chat(callback: types.CallbackQuery) -> None:
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to open profile for user %s from chat", user_id)
-        await callback.answer("Ошибка загрузки профиля", show_alert=True)
-        await callback.message.answer(f"Не удалось открыть профиль: <code>{esc(exc)}</code>")
+        await callback.answer("Ошибка, попробуйте позже", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("members:"))
@@ -1812,8 +2210,7 @@ async def cb_members(callback: types.CallbackQuery) -> None:
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to load members for chat %s", chat_id)
-        await callback.answer("Ошибка загрузки участников", show_alert=True)
-        await callback.message.answer(f"Не удалось загрузить участников: <code>{esc(exc)}</code>")
+        await callback.answer("Ошибка, попробуйте позже", show_alert=True)
 @dp.callback_query(F.data.startswith("member:"))
 async def cb_member_profile(callback: types.CallbackQuery) -> None:
     if callback.from_user:
@@ -1859,8 +2256,7 @@ async def cb_member_profile(callback: types.CallbackQuery) -> None:
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to open member profile %s", user_id)
-        await callback.answer("Ошибка загрузки профиля", show_alert=True)
-        await callback.message.answer(f"Не удалось открыть профиль: <code>{esc(exc)}</code>")
+        await callback.answer("Ошибка, попробуйте позже", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("openpm:"))
@@ -1899,8 +2295,7 @@ async def cb_open_private_chat(callback: types.CallbackQuery) -> None:
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to open private chat with user %s", user_id)
-        await callback.answer("Не удалось открыть чат", show_alert=True)
-        await callback.message.answer(f"Ошибка открытия чата: <code>{esc(exc)}</code>")
+        await callback.answer("Ошибка, попробуйте позже", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("write:"))
@@ -1921,59 +2316,148 @@ async def cb_write(callback: types.CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.set_state(UserFlow.waiting_for_chat_message)
-    await state.update_data(chat_id=chat_id, chat_page=chat_page)
+    await state.update_data(
+        chat_id=chat_id,
+        chat_page=chat_page,
+        write_prompt_message_id=callback.message.message_id,
+        write_callback_query_id=callback.id,
+    )
 
-    await callback.message.answer(
-        "✍️ Отправь текст сообщения одним сообщением.",
-        reply_markup=cancel_flow_keyboard(),
+    await safe_edit_message(
+        callback.message,
+        "✍️ Отправь текст, фото, видео или файл одним сообщением.",
+        cancel_flow_keyboard(),
     )
     await callback.answer()
 
 
-@dp.message(UserFlow.waiting_for_chat_message, F.text)
+@dp.message(UserFlow.waiting_for_chat_message)
 async def send_message_to_chat(message: types.Message, state: FSMContext) -> None:
     remember_user(message.from_user)
     data = await state.get_data()
 
     chat_id = parse_int(str(data.get("chat_id", "0")), default=0)
     chat_page = max(0, parse_int(str(data.get("chat_page", "0")), default=0))
+    prompt_message_id = parse_int(str(data.get("write_prompt_message_id", "0")), default=0)
+    write_callback_query_id = str(data.get("write_callback_query_id", "") or "").strip()
+    with contextlib.suppress(Exception):
+        await message.delete()
 
     if chat_id == 0:
         await state.clear()
-        await message.answer("Не удалось определить чат. Открой чат заново через меню.")
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text="Не удалось определить чат. Открой чат заново через меню.",
+        )
         return
 
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("Пустое сообщение отправить нельзя.")
+    if prompt_message_id > 0:
+        with contextlib.suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=prompt_message_id,
+                text="⏳ Отправка…",
+            )
+
+    text = (message.text or message.caption or "").strip()
+    attachment: MaxPhoto | MaxVideo | MaxFile | None = None
+    temp_path: str | None = None
+    try:
+        attachment, temp_path = await build_max_attachment_from_message(message)
+    except Exception as exc:
+        logger.warning("Failed to prepare outgoing media for %s: %s", message.from_user.id, exc)
+        error_text = (
+            f"❌ Не удалось подготовить медиа: <code>{esc(exc)}</code>\n"
+            "Попробуй отправить файл еще раз."
+        )
+        if prompt_message_id > 0:
+            with contextlib.suppress(Exception):
+                await bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=prompt_message_id,
+                    text=error_text,
+                    reply_markup=cancel_flow_keyboard(),
+                )
+                return
+        await bot.send_message(chat_id=message.chat.id, text=error_text, reply_markup=cancel_flow_keyboard())
+        return
+
+    if not text and attachment is None:
+        hint_text = "Отправь текст или медиафайл."
+        if prompt_message_id > 0:
+            with contextlib.suppress(Exception):
+                await bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=prompt_message_id,
+                    text=hint_text,
+                    reply_markup=cancel_flow_keyboard(),
+                )
+                return
+        await bot.send_message(chat_id=message.chat.id, text=hint_text)
         return
 
     try:
         client = await session_manager.ensure_client(message.from_user.id)
-        await client.send_message(text=text, chat_id=chat_id)
+        await client.send_message(
+            text=text if text else " ",
+            chat_id=chat_id,
+            attachment=attachment,
+        )
         await state.clear()
 
         HISTORY_ANCHORS.pop((message.from_user.id, chat_id), None)
-
-        ack_keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🔄 Обновить чат",
-                        callback_data=f"chat:{chat_id}:0:{chat_page}",
-                    )
-                ],
-                [InlineKeyboardButton(text="⬅️ К чатам", callback_data=f"chats:{chat_page}")],
-            ]
+        history_text, history_keyboard = await build_history_text(
+            tg_user_id=message.from_user.id,
+            client=client,
+            chat_id=chat_id,
+            offset=0,
+            chat_page=chat_page,
         )
-        await message.answer("✅ Сообщение отправлено.", reply_markup=ack_keyboard)
+
+        if prompt_message_id > 0:
+            try:
+                await bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=prompt_message_id,
+                    text=history_text,
+                    reply_markup=history_keyboard,
+                )
+            except TelegramBadRequest:
+                await bot.send_message(
+                    chat_id=message.chat.id,
+                    text=history_text,
+                    reply_markup=history_keyboard,
+                )
+        else:
+            await bot.send_message(
+                chat_id=message.chat.id,
+                text=history_text,
+                reply_markup=history_keyboard,
+            )
+
+        if write_callback_query_id:
+            with contextlib.suppress(Exception):
+                await bot.answer_callback_query(write_callback_query_id, text="Отправлено")
     except Exception as exc:
         logger.exception("Failed to send message for user %s", message.from_user.id)
-        await message.answer(
+        error_text = (
             f"❌ Не удалось отправить сообщение: <code>{esc(exc)}</code>\n"
-            "Попробуй снова.",
-            reply_markup=cancel_flow_keyboard(),
+            "Попробуй снова."
         )
+        if prompt_message_id > 0:
+            with contextlib.suppress(Exception):
+                await bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=prompt_message_id,
+                    text=error_text,
+                    reply_markup=cancel_flow_keyboard(),
+                )
+                return
+        await bot.send_message(chat_id=message.chat.id, text=error_text, reply_markup=cancel_flow_keyboard())
+    finally:
+        if temp_path:
+            with contextlib.suppress(Exception):
+                os.remove(temp_path)
 
 
 @dp.message(F.text.startswith("/media_"))

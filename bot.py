@@ -22,7 +22,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from pymax.files import File as MaxFile
 from pymax.files import Photo as MaxPhoto
 from pymax.files import Video as MaxVideo
@@ -51,7 +51,11 @@ MEDIA_CMD_REGEX = re.compile(r"^/media_([A-Za-z0-9]+)$")
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_INSTRUCTION_IMAGE_PATH = os.path.join(BASE_DIR, "instruction.png")
+MAIN_MENU_IMAGE_PATH = os.path.join(BASE_DIR, "main.png")
+CHATS_MENU_IMAGE_PATH = os.path.join(BASE_DIR, "chats.png")
 TOKEN_INSTRUCTION_PHOTO_FILE_ID: str | None = None
+MAIN_MENU_PHOTO_FILE_ID: str | None = None
+CHATS_MENU_PHOTO_FILE_ID: str | None = None
 
 try:
     UPDATE_POLL_SECONDS = max(3, int(os.getenv("UPDATE_POLL_SECONDS", "10").strip()))
@@ -79,6 +83,7 @@ except Exception:
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 OUTBOX_DIR = os.path.join("sessions", "outbox")
+UI_PHOTO_CACHE_PATH = os.path.join("sessions", "ui_photo_file_ids.json")
 TEMPORARY_SEND_ERROR_MARKERS = (
     "timeout",
     "timed out",
@@ -1038,6 +1043,291 @@ async def safe_edit_message(
         await message.answer(text=text, reply_markup=reply_markup)
 
 
+def _message_has_photo_or_video(message: types.Message) -> bool:
+    return bool(getattr(message, "photo", None) or getattr(message, "video", None))
+
+
+def _photo_cache_key(photo_ref: str) -> str | None:
+    full_path = os.path.abspath((photo_ref or "").strip())
+    if full_path == os.path.abspath(MAIN_MENU_IMAGE_PATH):
+        return "main"
+    if full_path == os.path.abspath(CHATS_MENU_IMAGE_PATH):
+        return "chats"
+    return None
+
+
+def _save_ui_photo_cache() -> None:
+    payload = {
+        "main": MAIN_MENU_PHOTO_FILE_ID or "",
+        "chats": CHATS_MENU_PHOTO_FILE_ID or "",
+    }
+    os.makedirs(os.path.dirname(UI_PHOTO_CACHE_PATH), exist_ok=True)
+    with open(UI_PHOTO_CACHE_PATH, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=True)
+
+
+def _load_ui_photo_cache() -> None:
+    global MAIN_MENU_PHOTO_FILE_ID, CHATS_MENU_PHOTO_FILE_ID
+    if not os.path.isfile(UI_PHOTO_CACHE_PATH):
+        return
+    try:
+        with open(UI_PHOTO_CACHE_PATH, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception as exc:
+        logger.debug("Could not read UI photo cache: %s", exc)
+        return
+
+    main_file_id = str(payload.get("main", "") or "").strip() if isinstance(payload, dict) else ""
+    chats_file_id = str(payload.get("chats", "") or "").strip() if isinstance(payload, dict) else ""
+    MAIN_MENU_PHOTO_FILE_ID = main_file_id or None
+    CHATS_MENU_PHOTO_FILE_ID = chats_file_id or None
+
+
+def _get_cached_photo_file_id(photo_ref: str) -> str | None:
+    key = _photo_cache_key(photo_ref)
+    if key == "main":
+        return MAIN_MENU_PHOTO_FILE_ID
+    if key == "chats":
+        return CHATS_MENU_PHOTO_FILE_ID
+    return None
+
+
+def _set_cached_photo_file_id(photo_ref: str, file_id: str | None) -> None:
+    global MAIN_MENU_PHOTO_FILE_ID, CHATS_MENU_PHOTO_FILE_ID
+    key = _photo_cache_key(photo_ref)
+    if key == "main":
+        MAIN_MENU_PHOTO_FILE_ID = file_id
+    elif key == "chats":
+        CHATS_MENU_PHOTO_FILE_ID = file_id
+    with contextlib.suppress(Exception):
+        _save_ui_photo_cache()
+
+
+def _extract_message_photo_file_id(message: types.Message) -> str | None:
+    photos = getattr(message, "photo", None) or []
+    if not photos:
+        return None
+    file_id = getattr(photos[-1], "file_id", None)
+    if isinstance(file_id, str) and file_id:
+        return file_id
+    return None
+
+
+def _resolve_photo_source(photo: str) -> str | FSInputFile | None:
+    ref = (photo or "").strip()
+    if not ref:
+        return None
+    full_path = os.path.abspath(ref)
+    if os.path.isfile(full_path):
+        return FSInputFile(full_path)
+    return ref
+
+
+async def _send_text_or_photo(
+    chat_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+    photo: str | None,
+) -> types.Message:
+    photo_ref = (photo or "").strip()
+    if not photo_ref:
+        return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+    cached_file_id = _get_cached_photo_file_id(photo_ref)
+    if cached_file_id:
+        try:
+            return await bot.send_photo(
+                chat_id=chat_id,
+                photo=cached_file_id,
+                caption=text,
+                reply_markup=reply_markup,
+            )
+        except TelegramBadRequest as exc:
+            logger.debug("Cached photo file_id is invalid for %s: %s", photo_ref, exc)
+            _set_cached_photo_file_id(photo_ref, None)
+
+    photo_source = _resolve_photo_source(photo_ref)
+    if photo_source is None:
+        logger.warning("Photo source not found for send: %s", photo_ref)
+        return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+    try:
+        sent = await bot.send_photo(
+            chat_id=chat_id,
+            photo=photo_source,
+            caption=text,
+            reply_markup=reply_markup,
+        )
+        cached_from_send = _extract_message_photo_file_id(sent)
+        if cached_from_send:
+            _set_cached_photo_file_id(photo_ref, cached_from_send)
+        return sent
+    except TelegramBadRequest as exc:
+        if is_telegram_url_fetch_error(exc) and photo_ref.startswith(("http://", "https://")):
+            file_name = _filename_from_url(photo_ref, "screen.jpg")
+            temp_path = await download_media_to_temp(photo_ref, file_name)
+            try:
+                sent = await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=FSInputFile(temp_path),
+                    caption=text,
+                    reply_markup=reply_markup,
+                )
+                cached_from_send = _extract_message_photo_file_id(sent)
+                if cached_from_send:
+                    _set_cached_photo_file_id(photo_ref, cached_from_send)
+                return sent
+            finally:
+                with contextlib.suppress(Exception):
+                    os.remove(temp_path)
+        logger.warning("Failed to send photo screen %s: %s", photo_ref, exc)
+        return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+
+async def _edit_photo_message(
+    message: types.Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+    photo: str,
+) -> bool:
+    photo_ref = (photo or "").strip()
+    if not photo_ref:
+        return False
+
+    cached_file_id = _get_cached_photo_file_id(photo_ref)
+    if cached_file_id:
+        try:
+            await message.edit_media(
+                media=InputMediaPhoto(media=cached_file_id, caption=text, parse_mode="HTML"),
+                reply_markup=reply_markup,
+            )
+            return True
+        except TelegramBadRequest as exc:
+            lowered = str(exc).lower()
+            if "message is not modified" in lowered:
+                return True
+            logger.debug("Cached edit_media photo file_id failed for %s: %s", photo_ref, exc)
+            _set_cached_photo_file_id(photo_ref, None)
+
+    media_source = _resolve_photo_source(photo_ref)
+    if media_source is None:
+        return False
+
+    try:
+        edited = await message.edit_media(
+            media=InputMediaPhoto(media=media_source, caption=text, parse_mode="HTML"),
+            reply_markup=reply_markup,
+        )
+        cached_from_message = (
+            _extract_message_photo_file_id(edited)
+            if isinstance(edited, types.Message)
+            else None
+        )
+        if cached_from_message:
+            _set_cached_photo_file_id(photo_ref, cached_from_message)
+        return True
+    except TelegramBadRequest as exc:
+        lowered = str(exc).lower()
+        if "message is not modified" in lowered:
+            return True
+        if is_telegram_url_fetch_error(exc) and photo_ref.startswith(("http://", "https://")):
+            file_name = _filename_from_url(photo_ref, "screen.jpg")
+            temp_path = await download_media_to_temp(photo_ref, file_name)
+            try:
+                await message.edit_media(
+                    media=InputMediaPhoto(
+                        media=FSInputFile(temp_path),
+                        caption=text,
+                        parse_mode="HTML",
+                    ),
+                    reply_markup=reply_markup,
+                )
+                return True
+            except TelegramBadRequest as nested_exc:
+                if "message is not modified" in str(nested_exc).lower():
+                    return True
+            finally:
+                with contextlib.suppress(Exception):
+                    os.remove(temp_path)
+        return False
+
+
+async def switch_screen_message(
+    source_message: types.Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    photo: str | None = None,
+) -> types.Message:
+    source_is_photo = _message_has_photo_or_video(source_message)
+    target_is_photo = bool((photo or "").strip())
+
+    if target_is_photo:
+        if source_is_photo:
+            current_photo_file_id = _extract_message_photo_file_id(source_message)
+            target_cached_file_id = _get_cached_photo_file_id(str(photo))
+            if (
+                current_photo_file_id
+                and target_cached_file_id
+                and current_photo_file_id == target_cached_file_id
+            ):
+                try:
+                    await source_message.edit_caption(caption=text, reply_markup=reply_markup)
+                    return source_message
+                except TelegramBadRequest as exc:
+                    if "message is not modified" in str(exc).lower():
+                        return source_message
+
+            if await _edit_photo_message(source_message, text, reply_markup, str(photo)):
+                return source_message
+            with contextlib.suppress(Exception):
+                await source_message.delete()
+            return await _send_text_or_photo(
+                chat_id=source_message.chat.id,
+                text=text,
+                reply_markup=reply_markup,
+                photo=photo,
+            )
+
+        with contextlib.suppress(Exception):
+            await source_message.delete()
+        return await _send_text_or_photo(
+            chat_id=source_message.chat.id,
+            text=text,
+            reply_markup=reply_markup,
+            photo=photo,
+        )
+
+    if source_is_photo:
+        with contextlib.suppress(Exception):
+            await source_message.delete()
+        return await bot.send_message(
+            chat_id=source_message.chat.id,
+            text=text,
+            reply_markup=reply_markup,
+        )
+
+    try:
+        await source_message.edit_text(text=text, reply_markup=reply_markup)
+        return source_message
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return source_message
+        return await bot.send_message(
+            chat_id=source_message.chat.id,
+            text=text,
+            reply_markup=reply_markup,
+        )
+
+
+async def send_main_menu_message(chat_id: int, has_token: bool, name: str) -> types.Message:
+    return await _send_text_or_photo(
+        chat_id=chat_id,
+        text=main_menu_text(has_token, name),
+        reply_markup=main_menu_keyboard(has_token),
+        photo=MAIN_MENU_IMAGE_PATH,
+    )
+
+
 async def edit_message_no_fallback(
     message: types.Message,
     text: str,
@@ -1272,32 +1562,13 @@ async def show_profile_card(
     keyboard: InlineKeyboardMarkup,
     avatar: str,
 ) -> None:
-    if avatar.startswith(("http://", "https://")):
-        try:
-            await source_message.answer_photo(photo=avatar, caption=text, reply_markup=keyboard)
-            with contextlib.suppress(Exception):
-                await source_message.delete()
-            return
-        except TelegramBadRequest as exc:
-            if not is_telegram_url_fetch_error(exc):
-                logger.warning("Profile avatar URL failed: %s", exc)
-            else:
-                file_name = _filename_from_url(avatar, "avatar.jpg")
-                path = await download_media_to_temp(avatar, file_name)
-                try:
-                    await source_message.answer_photo(
-                        photo=FSInputFile(path),
-                        caption=text,
-                        reply_markup=keyboard,
-                    )
-                    with contextlib.suppress(Exception):
-                        await source_message.delete()
-                    return
-                finally:
-                    with contextlib.suppress(Exception):
-                        os.remove(path)
-
-    await safe_edit_message(source_message, text, keyboard)
+    avatar_ref = (avatar or "").strip()
+    await switch_screen_message(
+        source_message,
+        text=text,
+        reply_markup=keyboard,
+        photo=avatar_ref or None,
+    )
 
 
 async def render_attachment_lines(
@@ -2063,7 +2334,7 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
     name = " ".join(
         part for part in [message.from_user.first_name, message.from_user.last_name] if part
     ).strip() or "друг"
-    await message.answer(main_menu_text(has_token, name), reply_markup=main_menu_keyboard(has_token))
+    await send_main_menu_message(message.chat.id, has_token, name)
 
 
 @dp.message(Command("menu"))
@@ -2076,7 +2347,7 @@ async def cmd_menu(message: types.Message, state: FSMContext) -> None:
     name = " ".join(
         part for part in [message.from_user.first_name, message.from_user.last_name] if part
     ).strip() or "друг"
-    await message.answer(main_menu_text(has_token, name), reply_markup=main_menu_keyboard(has_token))
+    await send_main_menu_message(message.chat.id, has_token, name)
 
 
 @dp.message(Command("login"))
@@ -2096,7 +2367,10 @@ async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
     await state.clear()
     clear_active_chat_view(message.from_user.id)
     has_token = session_manager.has_token(message.from_user.id)
-    await message.answer("Действие отменено.", reply_markup=main_menu_keyboard(has_token))
+    name = " ".join(
+        part for part in [message.from_user.first_name, message.from_user.last_name] if part
+    ).strip() or "друг"
+    await send_main_menu_message(message.chat.id, has_token, name)
 
 
 @dp.message(Command("health"))
@@ -2186,12 +2460,12 @@ async def cb_menu_main(callback: types.CallbackQuery, state: FSMContext) -> None
     ).strip() or "друг"
     text = main_menu_text(has_token, name)
     keyboard = main_menu_keyboard(has_token)
-    if getattr(callback.message, "photo", None) or getattr(callback.message, "video", None):
-        with contextlib.suppress(Exception):
-            await callback.message.delete()
-        await callback.message.answer(text, reply_markup=keyboard)
-    else:
-        await safe_edit_message(callback.message, text, keyboard)
+    await switch_screen_message(
+        callback.message,
+        text=text,
+        reply_markup=keyboard,
+        photo=MAIN_MENU_IMAGE_PATH,
+    )
     await callback.answer()
 
 
@@ -2214,7 +2488,12 @@ async def cb_profile_me(callback: types.CallbackQuery, state: FSMContext) -> Non
             "MAX: <b>не подключен ❌</b>\n\n"
             "Нажми «Войти в MAX», чтобы подключить аккаунт."
         )
-        await safe_edit_message(callback.message, text, self_profile_keyboard(False))
+        await switch_screen_message(
+            callback.message,
+            text=text,
+            reply_markup=self_profile_keyboard(False),
+            photo=None,
+        )
         await callback.answer()
         return
 
@@ -2249,10 +2528,11 @@ async def cb_logout_confirm(callback: types.CallbackQuery) -> None:
     if callback.from_user:
         remember_user(callback.from_user)
     clear_active_chat_view(callback.from_user.id)
-    await safe_edit_message(
+    await switch_screen_message(
         callback.message,
-        "<b>Выход из MAX</b>\n\nПодтвердить выход из аккаунта?",
-        logout_confirm_keyboard(),
+        text="<b>Выход из MAX</b>\n\nПодтвердить выход из аккаунта?",
+        reply_markup=logout_confirm_keyboard(),
+        photo=None,
     )
     await callback.answer()
 
@@ -2276,7 +2556,12 @@ async def cb_logout_cancel(callback: types.CallbackQuery, state: FSMContext) -> 
             "MAX: <b>не подключен ❌</b>\n\n"
             "Нажми «Войти в MAX», чтобы подключить аккаунт."
         )
-        await safe_edit_message(callback.message, text, self_profile_keyboard(False))
+        await switch_screen_message(
+            callback.message,
+            text=text,
+            reply_markup=self_profile_keyboard(False),
+            photo=None,
+        )
         await callback.answer()
         return
 
@@ -2317,11 +2602,14 @@ async def cb_logout_yes(callback: types.CallbackQuery, state: FSMContext) -> Non
         logger.warning("MAX logout failed for %s: %s", callback.from_user.id, exc)
 
     clear_user_runtime_cache(callback.from_user.id)
-
-    await safe_edit_message(
+    name = " ".join(
+        part for part in [callback.from_user.first_name, callback.from_user.last_name] if part
+    ).strip() or "друг"
+    await switch_screen_message(
         callback.message,
-        "✅ Ты вышел из MAX. Можно подключить аккаунт снова в профиле.",
-        main_menu_keyboard(False),
+        text="✅ Ты вышел из MAX.\n\n" + main_menu_text(False, name),
+        reply_markup=main_menu_keyboard(False),
+        photo=MAIN_MENU_IMAGE_PATH,
     )
     await callback.answer("Выход выполнен")
 
@@ -2343,10 +2631,11 @@ async def cb_auth_menu(callback: types.CallbackQuery, state: FSMContext) -> None
     await state.clear()
     clear_active_chat_view(callback.from_user.id)
     has_token = session_manager.has_token(callback.from_user.id)
-    await safe_edit_message(
+    await switch_screen_message(
         callback.message,
-        auth_menu_text(has_token),
-        auth_methods_keyboard(has_token),
+        text=auth_menu_text(has_token),
+        reply_markup=auth_methods_keyboard(has_token),
+        photo=None,
     )
     await callback.answer()
 
@@ -2563,9 +2852,15 @@ async def input_token(message: types.Message, state: FSMContext) -> None:
         await session_manager.validate_and_save_token(message.from_user.id, token)
         CHAT_CACHE.pop(message.from_user.id, None)
         await state.clear()
-        await wait_message.edit_text(
-            "✅ MAX токен сохранен. Теперь можно открыть список чатов.",
+        name = " ".join(
+            part for part in [message.from_user.first_name, message.from_user.last_name] if part
+        ).strip() or "друг"
+        rendered_text = "✅ MAX токен сохранен.\n\n" + main_menu_text(True, name)
+        await switch_screen_message(
+            wait_message,
+            text=rendered_text,
             reply_markup=main_menu_keyboard(True),
+            photo=MAIN_MENU_IMAGE_PATH,
         )
     except Exception as exc:
         logger.warning("Token save failed for user %s: %s", message.from_user.id, exc)
@@ -2583,33 +2878,47 @@ async def cb_chats(callback: types.CallbackQuery) -> None:
     clear_active_chat_view(callback.from_user.id)
 
     page = parse_int((callback.data or "").split(":", maxsplit=1)[1], default=0)
+    current_message = callback.message
 
     if not session_manager.has_token(callback.from_user.id):
         await callback.answer("Сначала авторизуйся в MAX", show_alert=True)
-        await safe_edit_message(
-            callback.message,
-            auth_menu_text(False),
+        await switch_screen_message(
+            current_message,
+            text=auth_menu_text(False),
             reply_markup=auth_methods_keyboard(False),
+            photo=None,
         )
         return
 
     try:
+        current_message = await switch_screen_message(
+            current_message,
+            text="⏳ Загружаю чаты…",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")]
+                ]
+            ),
+            photo=CHATS_MENU_IMAGE_PATH,
+        )
+
         client = await session_manager.ensure_client(callback.from_user.id)
         entries = await get_chat_entries(
             callback.from_user.id,
             client,
-            force_refresh=(page == 0),
+            force_refresh=False,
         )
 
         if not entries:
-            await safe_edit_message(
-                callback.message,
-                "💬 Чаты пока не найдены.",
-                InlineKeyboardMarkup(
+            await switch_screen_message(
+                current_message,
+                text="💬 Чаты пока не найдены.",
+                reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
                         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")]
                     ]
                 ),
+                photo=CHATS_MENU_IMAGE_PATH,
             )
             await callback.answer()
             return
@@ -2627,7 +2936,12 @@ async def cb_chats(callback: types.CallbackQuery) -> None:
             "Нажми на чат, чтобы открыть последние сообщения."
             f"{unread_line}"
         )
-        await safe_edit_message(callback.message, text, keyboard)
+        await switch_screen_message(
+            current_message,
+            text=text,
+            reply_markup=keyboard,
+            photo=CHATS_MENU_IMAGE_PATH,
+        )
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to load chats for user %s", callback.from_user.id)
@@ -2676,7 +2990,12 @@ async def cb_read_all(callback: types.CallbackQuery) -> None:
             "Нажми на чат, чтобы открыть последние сообщения."
             f"{unread_line}"
         )
-        await safe_edit_message(callback.message, text, keyboard)
+        await switch_screen_message(
+            callback.message,
+            text=text,
+            reply_markup=keyboard,
+            photo=CHATS_MENU_IMAGE_PATH,
+        )
         await callback.answer(f"Отмечено прочитанным: {cleared}")
     except Exception:
         logger.exception("Failed to mark all chats as read for %s", callback.from_user.id)
@@ -2710,11 +3029,16 @@ async def cb_chat(callback: types.CallbackQuery) -> None:
             offset=offset,
             chat_page=chat_page,
         )
-        await safe_edit_message(callback.message, text, keyboard)
+        rendered_message = await switch_screen_message(
+            callback.message,
+            text=text,
+            reply_markup=keyboard,
+            photo=None,
+        )
         set_active_chat_view(
             tg_user_id=callback.from_user.id,
-            tg_chat_id=callback.message.chat.id,
-            tg_message_id=callback.message.message_id,
+            tg_chat_id=rendered_message.chat.id,
+            tg_message_id=rendered_message.message_id,
             chat_id=chat_id,
             chat_page=chat_page,
             offset=offset,
@@ -2847,9 +3171,6 @@ async def cb_members(callback: types.CallbackQuery) -> None:
         await callback.answer("Чат не найден", show_alert=True)
         return
 
-    current_text = (callback.message.text or "").strip()
-    is_members_view = "Участники:" in current_text
-
     try:
         client = await session_manager.ensure_client(callback.from_user.id)
         entries = await get_chat_entries(callback.from_user.id, client)
@@ -2877,19 +3198,12 @@ async def cb_members(callback: types.CallbackQuery) -> None:
                     ]
                 ]
             )
-            if is_members_view:
-                await safe_edit_message(
-                    callback.message,
-                    empty_text,
-                    empty_keyboard,
-                )
-            else:
-                with contextlib.suppress(Exception):
-                    await callback.message.delete()
-                await callback.message.answer(
-                    empty_text,
-                    reply_markup=empty_keyboard,
-                )
+            await switch_screen_message(
+                callback.message,
+                text=empty_text,
+                reply_markup=empty_keyboard,
+                photo=None,
+            )
             await callback.answer()
             return
 
@@ -2912,12 +3226,12 @@ async def cb_members(callback: types.CallbackQuery) -> None:
             f"Страница <b>{current_page + 1}/{total_pages}</b>\n"
             "Нажми на участника, чтобы открыть профиль."
         )
-        if is_members_view:
-            await safe_edit_message(callback.message, text, keyboard)
-        else:
-            with contextlib.suppress(Exception):
-                await callback.message.delete()
-            await callback.message.answer(text, reply_markup=keyboard)
+        await switch_screen_message(
+            callback.message,
+            text=text,
+            reply_markup=keyboard,
+            photo=None,
+        )
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to load members for chat %s", chat_id)
@@ -3001,9 +3315,12 @@ async def cb_open_private_chat(callback: types.CallbackQuery) -> None:
             offset=0,
             chat_page=chat_page,
         )
-        with contextlib.suppress(Exception):
-            await callback.message.delete()
-        sent = await callback.message.answer(text, reply_markup=keyboard)
+        sent = await switch_screen_message(
+            callback.message,
+            text=text,
+            reply_markup=keyboard,
+            photo=None,
+        )
         set_active_chat_view(
             tg_user_id=callback.from_user.id,
             tg_chat_id=sent.chat.id,
@@ -3302,10 +3619,10 @@ async def fallback_text(message: types.Message, state: FSMContext) -> None:
         return
 
     has_token = session_manager.has_token(message.from_user.id)
-    await message.answer(
-        "Используй кнопки меню для управления чатами MAX.",
-        reply_markup=main_menu_keyboard(has_token),
-    )
+    name = " ".join(
+        part for part in [message.from_user.first_name, message.from_user.last_name] if part
+    ).strip() or "друг"
+    await send_main_menu_message(message.chat.id, has_token, name)
 
 
 async def main() -> None:
@@ -3313,6 +3630,7 @@ async def main() -> None:
     logger.info("Bot is starting")
     os.makedirs("sessions", exist_ok=True)
     os.makedirs(OUTBOX_DIR, exist_ok=True)
+    _load_ui_photo_cache()
     try:
         await ensure_bot_username()
     except Exception as exc:

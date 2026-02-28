@@ -48,6 +48,7 @@ UPDATE_POLL_CHAT_LIMIT = 12
 UPDATE_HISTORY_BACKWARD = 20
 TOKEN_REGEX = re.compile(r"An_[A-Za-z0-9._\\-]+")
 MEDIA_CMD_REGEX = re.compile(r"^/media_([A-Za-z0-9]+)$")
+DELETE_START_PAYLOAD_REGEX = re.compile(r"^del_(-?\d+)_(-?\d+)$")
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_INSTRUCTION_IMAGE_PATH = os.path.join(BASE_DIR, "instruction.png")
@@ -511,6 +512,30 @@ def media_command_markup(token: str) -> str:
     if BOT_USERNAME:
         return make_link(f"https://t.me/{BOT_USERNAME}?start=media_{token}", "получить в боте")
     return f"<code>{esc(command)}</code>"
+
+
+def delete_message_start_payload(chat_id: int, message_id: int) -> str:
+    return f"del_{int(chat_id)}_{int(message_id)}"
+
+
+def delete_message_command_markup(chat_id: int, message_id: int) -> str:
+    payload = delete_message_start_payload(chat_id, message_id)
+    if BOT_USERNAME:
+        return make_link(f"https://t.me/{BOT_USERNAME}?start={payload}", "🗑️")
+    return f"<code>/start {esc(payload)}</code>"
+
+
+def parse_delete_start_payload(raw_payload: str) -> tuple[int, int] | None:
+    payload = (raw_payload or "").strip()
+    match = DELETE_START_PAYLOAD_REGEX.fullmatch(payload)
+    if not match:
+        return None
+
+    chat_id = parse_int(match.group(1), default=0)
+    message_id = parse_int(match.group(2), default=0)
+    if chat_id == 0 or message_id == 0:
+        return None
+    return chat_id, message_id
 
 
 def _filename_from_url(url: str, fallback: str) -> str:
@@ -1856,9 +1881,9 @@ async def build_history_text(
     show_members = bool(
         chat_entry and chat_entry.chat_type.upper() == "CHAT" and chat_entry.participants
     )
+    me_id = parse_int(str(getattr(client.me, "id", 0)), default=0)
     profile_user_id: int | None = None
     if chat_entry and chat_entry.chat_type.upper() == "DIALOG":
-        me_id = parse_int(str(getattr(client.me, "id", 0)), default=0)
         for pid in chat_entry.participants:
             if pid != me_id:
                 profile_user_id = pid
@@ -1881,11 +1906,17 @@ async def build_history_text(
 
     rendered_blocks: list[str] = []
     for msg in page_messages:
+        sender_id = parse_int(str(getattr(msg, "sender", 0)), default=0)
         sender_name = user_display_name(users_map.get(msg.sender), f"Пользователь {msg.sender}")
+        message_id = parse_int(str(getattr(msg, "id", 0)), default=0)
+        delete_markup = ""
+        if sender_id > 0 and sender_id == me_id and message_id > 0:
+            delete_markup = delete_message_command_markup(chat_id, message_id)
         attachment_lines = await render_attachment_lines(tg_user_id, client, chat_id, msg)
         body = (msg.text or "").strip()
 
-        block_lines = [f"<b>{esc(sender_name)}</b> <code>{time_label(msg.time)}</code>"]
+        header_prefix = f"{delete_markup} " if delete_markup else ""
+        block_lines = [f"{header_prefix}<b>{esc(sender_name)}</b> <code>{time_label(msg.time)}</code>"]
         if body:
             block_lines.append(esc(body))
         if attachment_lines:
@@ -2202,6 +2233,40 @@ async def send_media_by_token(message: types.Message, token: str) -> None:
         )
 
 
+async def delete_max_message_by_link(message: types.Message, chat_id: int, message_id: int) -> None:
+    try:
+        client = await session_manager.ensure_client(message.from_user.id)
+        await client.delete_message(chat_id=chat_id, message_ids=[message_id], for_me=False)
+    except Exception as exc:
+        logger.warning(
+            "Failed to delete MAX message user=%s chat=%s message=%s: %s",
+            message.from_user.id,
+            chat_id,
+            message_id,
+            exc,
+        )
+        failed_notice = await message.answer("Ошибка, попробуйте позже")
+        await asyncio.sleep(2)
+        with contextlib.suppress(Exception):
+            await failed_notice.delete()
+        return
+
+    ok_notice = await message.answer("Сообщение удалено!")
+    HISTORY_ANCHORS.pop((message.from_user.id, chat_id), None)
+    refreshed = await refresh_active_chat_view_now(message.from_user.id, expected_chat_id=chat_id)
+    if not refreshed:
+        with contextlib.suppress(Exception):
+            await session_manager.disconnect_client(message.from_user.id)
+        HISTORY_ANCHORS.pop((message.from_user.id, chat_id), None)
+        await refresh_active_chat_view_now(message.from_user.id, expected_chat_id=chat_id)
+    await asyncio.sleep(0.7)
+    HISTORY_ANCHORS.pop((message.from_user.id, chat_id), None)
+    await refresh_active_chat_view_now(message.from_user.id, expected_chat_id=chat_id)
+    await asyncio.sleep(1.3)
+    with contextlib.suppress(Exception):
+        await ok_notice.delete()
+
+
 def summarize_update_body(msg: Any) -> str:
     text = (getattr(msg, "text", "") or "").strip()
     attaches = getattr(msg, "attaches", None) or []
@@ -2371,6 +2436,62 @@ async def refresh_active_chat_for_user(tg_user_id: int) -> None:
             current_view.in_progress = False
 
 
+async def refresh_active_chat_view_now(tg_user_id: int, expected_chat_id: int | None = None) -> bool:
+    view = ACTIVE_CHAT_VIEWS.get(tg_user_id)
+    if view is None or view.in_progress:
+        return False
+    if expected_chat_id is not None and view.chat_id != expected_chat_id:
+        return False
+
+    was_updated = False
+    view.in_progress = True
+    try:
+        previous_signature = view.signature
+        client = await session_manager.ensure_client(tg_user_id)
+        text, keyboard = await build_history_text(
+            tg_user_id=tg_user_id,
+            client=client,
+            chat_id=view.chat_id,
+            offset=view.offset,
+            chat_page=view.chat_page,
+        )
+        signature = chat_view_signature(text, keyboard)
+        if signature != view.signature:
+            try:
+                await bot.edit_message_text(
+                    chat_id=view.tg_chat_id,
+                    message_id=view.tg_message_id,
+                    text=text,
+                    reply_markup=keyboard,
+                )
+                was_updated = True
+            except TelegramBadRequest as exc:
+                lowered = str(exc).lower()
+                if "message is not modified" not in lowered:
+                    if "message to edit not found" in lowered or "message can't be edited" in lowered:
+                        clear_active_chat_view(tg_user_id)
+                        return False
+                    logger.debug("Manual chat refresh failed user=%s: %s", tg_user_id, exc)
+        else:
+            was_updated = signature != previous_signature
+
+        current_view = ACTIVE_CHAT_VIEWS.get(tg_user_id)
+        if current_view and current_view.tg_message_id == view.tg_message_id:
+            current_view.signature = signature
+            current_view.last_refresh_at = time.time()
+
+        if view.offset == 0:
+            mark_chat_read(tg_user_id, view.chat_id)
+    except Exception as exc:
+        logger.debug("Skip manual chat refresh for %s: %s", tg_user_id, exc)
+        return False
+    finally:
+        current_view = ACTIVE_CHAT_VIEWS.get(tg_user_id)
+        if current_view and current_view.tg_message_id == view.tg_message_id:
+            current_view.in_progress = False
+    return was_updated
+
+
 async def chat_refresh_loop() -> None:
     while True:
         try:
@@ -2470,6 +2591,16 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
     text_raw = (message.text or "").strip()
     parts = text_raw.split(maxsplit=1)
     start_payload = parts[1].strip() if len(parts) > 1 else ""
+    delete_target = parse_delete_start_payload(start_payload)
+    if delete_target is not None:
+        chat_id, message_id = delete_target
+        await session_manager.clear_auth_flow(message.from_user.id)
+        await state.clear()
+        with contextlib.suppress(Exception):
+            await message.delete()
+        await delete_max_message_by_link(message, chat_id, message_id)
+        return
+
     if start_payload.startswith("media_"):
         token = start_payload[6:]
         await session_manager.clear_auth_flow(message.from_user.id)
@@ -3809,7 +3940,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-

@@ -116,6 +116,14 @@ PERMANENT_SEND_ERROR_MARKERS = (
     "auth",
     "unauthorized",
 )
+AUTH_RELOGIN_ERROR_MARKERS = (
+    "invalid token",
+    "login.token",
+    "fail_login_token",
+    "ошибка входа",
+    "авторизируйтесь снова",
+    "relogin",
+)
 
 HISTORY_ANCHORS: dict[tuple[int, int], int] = {}
 CHAT_CACHE: dict[int, tuple[float, list["ChatEntry"]]] = {}
@@ -352,6 +360,38 @@ def is_temporary_send_error(exc: Exception) -> bool:
     if any(marker in lowered for marker in PERMANENT_SEND_ERROR_MARKERS):
         return False
     return any(marker in lowered for marker in TEMPORARY_SEND_ERROR_MARKERS)
+
+
+def is_relogin_required_error(exc: Exception) -> bool:
+    lowered = str(exc).lower()
+    return any(marker in lowered for marker in AUTH_RELOGIN_ERROR_MARKERS)
+
+
+def disconnected_self_profile_text(tg_user: types.User) -> str:
+    name = " ".join(part for part in [tg_user.first_name, tg_user.last_name] if part).strip() or "друг"
+    return (
+        "<b>Твой профиль</b>\n"
+        f"Telegram: <b>{esc(name)}</b>\n"
+        "MAX: <b>не подключен ❌</b>\n\n"
+        "Нажми «Войти в MAX», чтобы подключить аккаунт."
+    )
+
+
+async def show_disconnected_self_profile(message: types.Message, tg_user: types.User) -> None:
+    await switch_screen_message(
+        message,
+        text=disconnected_self_profile_text(tg_user),
+        reply_markup=self_profile_keyboard(False),
+        photo=None,
+    )
+
+
+async def force_relogin_state(tg_user_id: int) -> None:
+    try:
+        await session_manager.logout(tg_user_id)
+    except Exception as exc:
+        logger.warning("Failed to clear invalid MAX session for %s: %s", tg_user_id, exc)
+    clear_user_runtime_cache(tg_user_id)
 
 
 def normalize_token_input(raw: str) -> str | None:
@@ -2907,21 +2947,7 @@ async def cb_profile_me(callback: types.CallbackQuery, state: FSMContext) -> Non
 
     has_token = session_manager.has_token(callback.from_user.id)
     if not has_token:
-        name = " ".join(
-            part for part in [callback.from_user.first_name, callback.from_user.last_name] if part
-        ).strip() or "друг"
-        text = (
-            "<b>Твой профиль</b>\n"
-            f"Telegram: <b>{esc(name)}</b>\n"
-            "MAX: <b>не подключен ❌</b>\n\n"
-            "Нажми «Войти в MAX», чтобы подключить аккаунт."
-        )
-        await switch_screen_message(
-            callback.message,
-            text=text,
-            reply_markup=self_profile_keyboard(False),
-            photo=None,
-        )
+        await show_disconnected_self_profile(callback.message, callback.from_user)
         await callback.answer()
         return
 
@@ -2947,6 +2973,11 @@ async def cb_profile_me(callback: types.CallbackQuery, state: FSMContext) -> Non
         await callback.answer()
     except Exception as exc:
         logger.exception("Failed to open self profile for %s", callback.from_user.id)
+        if is_relogin_required_error(exc):
+            await force_relogin_state(callback.from_user.id)
+            await show_disconnected_self_profile(callback.message, callback.from_user)
+            await callback.answer("Сессия MAX истекла. Войди заново", show_alert=True)
+            return
         await callback.answer("Ошибка загрузки профиля", show_alert=True)
         await callback.message.answer(f"Не удалось открыть профиль: <code>{esc(exc)}</code>")
 
@@ -2975,21 +3006,7 @@ async def cb_logout_cancel(callback: types.CallbackQuery, state: FSMContext) -> 
 
     has_token = session_manager.has_token(callback.from_user.id)
     if not has_token:
-        name = " ".join(
-            part for part in [callback.from_user.first_name, callback.from_user.last_name] if part
-        ).strip() or "друг"
-        text = (
-            "<b>Твой профиль</b>\n"
-            f"Telegram: <b>{esc(name)}</b>\n"
-            "MAX: <b>не подключен ❌</b>\n\n"
-            "Нажми «Войти в MAX», чтобы подключить аккаунт."
-        )
-        await switch_screen_message(
-            callback.message,
-            text=text,
-            reply_markup=self_profile_keyboard(False),
-            photo=None,
-        )
+        await show_disconnected_self_profile(callback.message, callback.from_user)
         await callback.answer()
         return
 
@@ -3012,8 +3029,13 @@ async def cb_logout_cancel(callback: types.CallbackQuery, state: FSMContext) -> 
             self_profile_keyboard(True),
         )
         await callback.answer()
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to return to self profile on logout cancel for %s", callback.from_user.id)
+        if is_relogin_required_error(exc):
+            await force_relogin_state(callback.from_user.id)
+            await show_disconnected_self_profile(callback.message, callback.from_user)
+            await callback.answer("Сессия MAX истекла. Войди заново", show_alert=True)
+            return
         await callback.answer("Ошибка, попробуйте позже", show_alert=True)
 
 

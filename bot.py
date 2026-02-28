@@ -56,6 +56,8 @@ CHATS_MENU_IMAGE_PATH = os.path.join(BASE_DIR, "chats.png")
 TOKEN_INSTRUCTION_PHOTO_FILE_ID: str | None = None
 MAIN_MENU_PHOTO_FILE_ID: str | None = None
 CHATS_MENU_PHOTO_FILE_ID: str | None = None
+MAIN_MENU_PHOTO_SHA1: str | None = None
+CHATS_MENU_PHOTO_SHA1: str | None = None
 
 try:
     UPDATE_POLL_SECONDS = max(3, int(os.getenv("UPDATE_POLL_SECONDS", "10").strip()))
@@ -117,6 +119,7 @@ PERMANENT_SEND_ERROR_MARKERS = (
 HISTORY_ANCHORS: dict[tuple[int, int], int] = {}
 CHAT_CACHE: dict[int, tuple[float, list["ChatEntry"]]] = {}
 MEDIA_CACHE: dict[str, "MediaRequest"] = {}
+MEDIA_REQUEST_INDEX: dict[str, str] = {}
 UPDATE_LAST_SEEN: dict[tuple[int, int], int] = {}
 UNREAD_COUNTS: dict[tuple[int, int], int] = {}
 ACTIVE_CHAT_VIEWS: dict[int, "ActiveChatView"] = {}
@@ -410,6 +413,31 @@ def make_link(url: str, label: str) -> str:
     return f'<a href="{esc(url)}">{esc(label)}</a>'
 
 
+def _media_request_key(
+    tg_user_id: int,
+    chat_id: int,
+    message_id: int,
+    kind: str,
+    *,
+    file_id: int | None = None,
+    video_id: int | None = None,
+    url: str | None = None,
+    name: str | None = None,
+) -> str:
+    payload = {
+        "tg_user_id": int(tg_user_id),
+        "chat_id": int(chat_id),
+        "message_id": int(message_id),
+        "kind": str(kind or "").upper(),
+        "file_id": int(file_id or 0),
+        "video_id": int(video_id or 0),
+        "url": str(url or ""),
+        "name": str(name or ""),
+    }
+    raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
 def cleanup_media_cache() -> None:
     now = time.time()
     stale_keys = [
@@ -419,6 +447,14 @@ def cleanup_media_cache() -> None:
     ]
     for token in stale_keys:
         MEDIA_CACHE.pop(token, None)
+
+    stale_index = [
+        request_key
+        for request_key, token in MEDIA_REQUEST_INDEX.items()
+        if token in stale_keys or token not in MEDIA_CACHE
+    ]
+    for request_key in stale_index:
+        MEDIA_REQUEST_INDEX.pop(request_key, None)
 
 
 def register_media_request(
@@ -433,7 +469,29 @@ def register_media_request(
     name: str | None = None,
 ) -> str:
     cleanup_media_cache()
+    request_key = _media_request_key(
+        tg_user_id=tg_user_id,
+        chat_id=chat_id,
+        message_id=message_id,
+        kind=kind,
+        file_id=file_id,
+        video_id=video_id,
+        url=url,
+        name=name,
+    )
+
+    cached_token = MEDIA_REQUEST_INDEX.get(request_key)
+    if cached_token:
+        cached_item = MEDIA_CACHE.get(cached_token)
+        if cached_item is not None:
+            cached_item.created_at = time.time()
+            return cached_token
+        MEDIA_REQUEST_INDEX.pop(request_key, None)
+
     token = secrets.token_urlsafe(8).replace("_", "").replace("-", "")[:12]
+    while token in MEDIA_CACHE:
+        token = secrets.token_urlsafe(8).replace("_", "").replace("-", "")[:12]
+
     MEDIA_CACHE[token] = MediaRequest(
         tg_user_id=tg_user_id,
         chat_id=chat_id,
@@ -444,6 +502,7 @@ def register_media_request(
         url=url,
         name=name,
     )
+    MEDIA_REQUEST_INDEX[request_key] = token
     return token
 
 
@@ -720,7 +779,7 @@ def cancel_flow_keyboard() -> InlineKeyboardMarkup:
 
 def dismiss_message_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="👌 Окей", callback_data="msg:close")]]
+        inline_keyboard=[[InlineKeyboardButton(text="👌", callback_data="msg:close")]]
     )
 
 
@@ -1056,10 +1115,30 @@ def _photo_cache_key(photo_ref: str) -> str | None:
     return None
 
 
+def _file_sha1(path: str) -> str | None:
+    full_path = os.path.abspath((path or "").strip())
+    if not full_path or not os.path.isfile(full_path):
+        return None
+
+    h = hashlib.sha1()
+    with open(full_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 256), b""):
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _save_ui_photo_cache() -> None:
     payload = {
-        "main": MAIN_MENU_PHOTO_FILE_ID or "",
-        "chats": CHATS_MENU_PHOTO_FILE_ID or "",
+        "main": {
+            "file_id": MAIN_MENU_PHOTO_FILE_ID or "",
+            "sha1": MAIN_MENU_PHOTO_SHA1 or "",
+        },
+        "chats": {
+            "file_id": CHATS_MENU_PHOTO_FILE_ID or "",
+            "sha1": CHATS_MENU_PHOTO_SHA1 or "",
+        },
     }
     os.makedirs(os.path.dirname(UI_PHOTO_CACHE_PATH), exist_ok=True)
     with open(UI_PHOTO_CACHE_PATH, "w", encoding="utf-8") as fh:
@@ -1068,37 +1147,99 @@ def _save_ui_photo_cache() -> None:
 
 def _load_ui_photo_cache() -> None:
     global MAIN_MENU_PHOTO_FILE_ID, CHATS_MENU_PHOTO_FILE_ID
+    global MAIN_MENU_PHOTO_SHA1, CHATS_MENU_PHOTO_SHA1
+
+    current_main_sha1 = _file_sha1(MAIN_MENU_IMAGE_PATH)
+    current_chats_sha1 = _file_sha1(CHATS_MENU_IMAGE_PATH)
+
     if not os.path.isfile(UI_PHOTO_CACHE_PATH):
+        MAIN_MENU_PHOTO_SHA1 = current_main_sha1
+        CHATS_MENU_PHOTO_SHA1 = current_chats_sha1
         return
     try:
         with open(UI_PHOTO_CACHE_PATH, "r", encoding="utf-8") as fh:
             payload = json.load(fh)
     except Exception as exc:
         logger.debug("Could not read UI photo cache: %s", exc)
+        MAIN_MENU_PHOTO_SHA1 = current_main_sha1
+        CHATS_MENU_PHOTO_SHA1 = current_chats_sha1
         return
 
-    main_file_id = str(payload.get("main", "") or "").strip() if isinstance(payload, dict) else ""
-    chats_file_id = str(payload.get("chats", "") or "").strip() if isinstance(payload, dict) else ""
-    MAIN_MENU_PHOTO_FILE_ID = main_file_id or None
-    CHATS_MENU_PHOTO_FILE_ID = chats_file_id or None
+    main_file_id = ""
+    main_sha1 = ""
+    chats_file_id = ""
+    chats_sha1 = ""
+
+    if isinstance(payload, dict):
+        raw_main = payload.get("main")
+        raw_chats = payload.get("chats")
+
+        # Backward compatible: old format stored plain file_id strings.
+        if isinstance(raw_main, str):
+            main_file_id = raw_main.strip()
+        elif isinstance(raw_main, dict):
+            main_file_id = str(raw_main.get("file_id", "") or "").strip()
+            main_sha1 = str(raw_main.get("sha1", "") or "").strip()
+
+        if isinstance(raw_chats, str):
+            chats_file_id = raw_chats.strip()
+        elif isinstance(raw_chats, dict):
+            chats_file_id = str(raw_chats.get("file_id", "") or "").strip()
+            chats_sha1 = str(raw_chats.get("sha1", "") or "").strip()
+
+    if main_file_id and main_sha1 and current_main_sha1 and main_sha1 == current_main_sha1:
+        MAIN_MENU_PHOTO_FILE_ID = main_file_id
+    else:
+        MAIN_MENU_PHOTO_FILE_ID = None
+
+    if chats_file_id and chats_sha1 and current_chats_sha1 and chats_sha1 == current_chats_sha1:
+        CHATS_MENU_PHOTO_FILE_ID = chats_file_id
+    else:
+        CHATS_MENU_PHOTO_FILE_ID = None
+
+    MAIN_MENU_PHOTO_SHA1 = current_main_sha1
+    CHATS_MENU_PHOTO_SHA1 = current_chats_sha1
+
+    # Rewrite old/invalid cache shape to the new format.
+    with contextlib.suppress(Exception):
+        _save_ui_photo_cache()
 
 
 def _get_cached_photo_file_id(photo_ref: str) -> str | None:
+    global MAIN_MENU_PHOTO_FILE_ID, CHATS_MENU_PHOTO_FILE_ID
+    global MAIN_MENU_PHOTO_SHA1, CHATS_MENU_PHOTO_SHA1
+
     key = _photo_cache_key(photo_ref)
     if key == "main":
+        current_sha1 = _file_sha1(MAIN_MENU_IMAGE_PATH)
+        if current_sha1 and MAIN_MENU_PHOTO_SHA1 and current_sha1 != MAIN_MENU_PHOTO_SHA1:
+            MAIN_MENU_PHOTO_FILE_ID = None
+            MAIN_MENU_PHOTO_SHA1 = current_sha1
+            with contextlib.suppress(Exception):
+                _save_ui_photo_cache()
         return MAIN_MENU_PHOTO_FILE_ID
     if key == "chats":
+        current_sha1 = _file_sha1(CHATS_MENU_IMAGE_PATH)
+        if current_sha1 and CHATS_MENU_PHOTO_SHA1 and current_sha1 != CHATS_MENU_PHOTO_SHA1:
+            CHATS_MENU_PHOTO_FILE_ID = None
+            CHATS_MENU_PHOTO_SHA1 = current_sha1
+            with contextlib.suppress(Exception):
+                _save_ui_photo_cache()
         return CHATS_MENU_PHOTO_FILE_ID
     return None
 
 
 def _set_cached_photo_file_id(photo_ref: str, file_id: str | None) -> None:
     global MAIN_MENU_PHOTO_FILE_ID, CHATS_MENU_PHOTO_FILE_ID
+    global MAIN_MENU_PHOTO_SHA1, CHATS_MENU_PHOTO_SHA1
+
     key = _photo_cache_key(photo_ref)
     if key == "main":
         MAIN_MENU_PHOTO_FILE_ID = file_id
+        MAIN_MENU_PHOTO_SHA1 = _file_sha1(MAIN_MENU_IMAGE_PATH)
     elif key == "chats":
         CHATS_MENU_PHOTO_FILE_ID = file_id
+        CHATS_MENU_PHOTO_SHA1 = _file_sha1(CHATS_MENU_IMAGE_PATH)
     with contextlib.suppress(Exception):
         _save_ui_photo_cache()
 
@@ -1357,15 +1498,27 @@ def remember_user(user: types.User) -> None:
 def clear_user_runtime_cache(tg_user_id: int) -> None:
     clear_active_chat_view(tg_user_id)
     CHAT_CACHE.pop(tg_user_id, None)
+
     media_keys = [key for key, item in MEDIA_CACHE.items() if item.tg_user_id == tg_user_id]
     for key in media_keys:
         MEDIA_CACHE.pop(key, None)
+
+    media_index_keys = [
+        request_key
+        for request_key, token in MEDIA_REQUEST_INDEX.items()
+        if token in media_keys
+    ]
+    for request_key in media_index_keys:
+        MEDIA_REQUEST_INDEX.pop(request_key, None)
+
     anchor_keys = [key for key in HISTORY_ANCHORS if key[0] == tg_user_id]
     for key in anchor_keys:
         HISTORY_ANCHORS.pop(key, None)
+
     seen_keys = [key for key in UPDATE_LAST_SEEN if key[0] == tg_user_id]
     for key in seen_keys:
         UPDATE_LAST_SEEN.pop(key, None)
+
     unread_keys = [key for key in UNREAD_COUNTS if key[0] == tg_user_id]
     for key in unread_keys:
         UNREAD_COUNTS.pop(key, None)
@@ -1842,7 +1995,8 @@ async def send_media_by_token(message: types.Message, token: str) -> None:
     cleanup_media_cache()
     request = MEDIA_CACHE.get(token)
     if request is None:
-        await message.answer("Ссылка для получения медиа устарела. Открой чат заново и нажми новую ссылку.")
+        await message.answer("Ссылка для получения медиа устарела. Открой чат заново и нажми новую ссылку.",
+                             reply_markup=dismiss_message_keyboard())
         return
 
     if request.tg_user_id != message.from_user.id:
@@ -3655,3 +3809,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+

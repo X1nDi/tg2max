@@ -1,23 +1,29 @@
-# Секреты (Compose подтянет их сам, в самом образе их быть не должно)
+# Secrets
 .env
+.env.*
 
-# Сессии (мы пробрасываем их через volume, копировать локальные не нужно)
+# Runtime (mounted by volume in compose)
 sessions/
 
-# Виртуальное окружение (в Docker свои зависимости)
+# Python venv/cache
+.venv/
 venv/
 env/
-.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
 
-# Git-файлы
+# VCS
 .git/
 .gitignore
 
-# Кэш
-__pycache__/
-*.pyc
-*.pyo
-
-# IDE
-.vscode/
+# IDE/editor
 .idea/
+.vscode/
+
+# Docs and local artifacts not needed in runtime image
+docs/
+*.log
+.DS_Store
+Thumbs.db

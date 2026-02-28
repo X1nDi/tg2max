@@ -1,24 +1,29 @@
-# Секреты
+# Secrets
 .env
+.env.*
 
-# Сессии пользователей Max
+# Runtime data
 sessions/
 
-# Виртуальное окружение Python
-venv/
-env/
-.venv/
-
-# Кэш Python и скомпилированные файлы
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
 .Python
 
-# Логи (если будешь добавлять логирование в файлы)
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
 *.log
 
-# IDE и редакторы
-.vscode/
+# IDE/editor
 .idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

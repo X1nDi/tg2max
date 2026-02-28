@@ -808,6 +808,15 @@ def dismiss_message_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def update_notification_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Прочитать", callback_data=f"notify:read:{int(chat_id)}")],
+            [InlineKeyboardButton(text="💬 Перейти в чат", callback_data=f"notify:open:{int(chat_id)}")],
+        ]
+    )
+
+
 def auth_menu_text(has_token: bool) -> str:
     status = "подключен ✅" if has_token else "не подключен ❌"
     return (
@@ -1039,6 +1048,13 @@ def build_chats_keyboard(
 
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows), page, total_pages
+
+
+def resolve_chat_page(entries: list[ChatEntry], chat_id: int) -> int:
+    for index, entry in enumerate(entries):
+        if int(entry.chat_id) == int(chat_id):
+            return index // CHAT_PAGE_SIZE
+    return 0
 
 
 def build_history_keyboard(
@@ -2371,7 +2387,7 @@ async def poll_updates_for_user(tg_user_id: int) -> None:
                 await bot.send_message(
                     chat_id=tg_user_id,
                     text=notify_text,
-                    reply_markup=dismiss_message_keyboard(),
+                    reply_markup=update_notification_keyboard(entry.chat_id),
                 )
                 METRICS.update_notifications += 1
             except Exception as exc:
@@ -3114,6 +3130,91 @@ async def cb_msg_close(callback: types.CallbackQuery) -> None:
     except Exception:
         pass
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("notify:read:"))
+async def cb_notify_read(callback: types.CallbackQuery) -> None:
+    if callback.from_user:
+        remember_user(callback.from_user)
+
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    chat_id = parse_int(parts[2], default=0)
+    if chat_id <= 0:
+        await callback.answer("Чат не найден", show_alert=True)
+        return
+
+    mark_chat_read(callback.from_user.id, chat_id)
+    with contextlib.suppress(Exception):
+        await callback.message.delete()
+    await callback.answer("Прочитано")
+
+
+@dp.callback_query(F.data.startswith("notify:open:"))
+async def cb_notify_open(callback: types.CallbackQuery) -> None:
+    if callback.from_user:
+        remember_user(callback.from_user)
+
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    chat_id = parse_int(parts[2], default=0)
+    if chat_id <= 0:
+        await callback.answer("Чат не найден", show_alert=True)
+        return
+
+    if not session_manager.has_token(callback.from_user.id):
+        await callback.answer("Сначала авторизуйся в MAX", show_alert=True)
+        await switch_screen_message(
+            callback.message,
+            text=auth_menu_text(False),
+            reply_markup=auth_methods_keyboard(False),
+            photo=None,
+        )
+        return
+
+    try:
+        client = await session_manager.ensure_client(callback.from_user.id)
+        entries = await get_chat_entries(callback.from_user.id, client, force_refresh=False)
+        chat_page = resolve_chat_page(entries, chat_id)
+        text, keyboard = await build_history_text(
+            tg_user_id=callback.from_user.id,
+            client=client,
+            chat_id=chat_id,
+            offset=0,
+            chat_page=chat_page,
+        )
+        rendered_message = await switch_screen_message(
+            callback.message,
+            text=text,
+            reply_markup=keyboard,
+            photo=None,
+        )
+        set_active_chat_view(
+            tg_user_id=callback.from_user.id,
+            tg_chat_id=rendered_message.chat.id,
+            tg_message_id=rendered_message.message_id,
+            chat_id=chat_id,
+            chat_page=chat_page,
+            offset=0,
+            signature=chat_view_signature(text, keyboard),
+            paused=False,
+        )
+        mark_chat_read(callback.from_user.id, chat_id)
+        await callback.answer()
+    except Exception as exc:
+        logger.exception(
+            "Failed to open chat from update notify for user=%s chat=%s: %s",
+            callback.from_user.id,
+            chat_id,
+            exc,
+        )
+        await callback.answer("Ошибка, попробуйте позже", show_alert=True)
 
 
 @dp.message(UserFlow.waiting_for_token, F.text)

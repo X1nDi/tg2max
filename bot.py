@@ -817,6 +817,176 @@ def update_notification_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def _with_dismiss_row(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    dismiss_rows = dismiss_message_keyboard().inline_keyboard
+    return InlineKeyboardMarkup(inline_keyboard=[*rows, *dismiss_rows])
+
+
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="🩺 Health", callback_data="admin:health"),
+            InlineKeyboardButton(text="📊 Stats", callback_data="admin:stats"),
+        ],
+        [
+            InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users"),
+            InlineKeyboardButton(text="📥 Очередь", callback_data="admin:queue"),
+        ],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:panel")],
+    ]
+    return _with_dismiss_row(rows)
+
+
+def admin_back_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin:panel")]]
+    return _with_dismiss_row(rows)
+
+
+def render_health_text() -> str:
+    uptime = format_duration(int(time.time() - METRICS.started_at))
+    authorized_users = session_manager.get_authorized_user_ids()
+    pending_queue = session_manager.count_pending_outgoing()
+    queue_users = session_manager.get_outgoing_user_ids()
+    latencies = list(METRICS.latencies_ms)
+
+    if latencies:
+        avg_latency = sum(latencies) / len(latencies)
+        p95_latency = percentile(latencies, 0.95)
+        latency_line = f"{avg_latency:.0f}ms avg / {p95_latency:.0f}ms p95"
+    else:
+        latency_line = "нет данных"
+
+    lines = [
+        "<b>Health</b>",
+        f"Uptime: <code>{esc(uptime)}</code>",
+        f"Авторизовано пользователей: <b>{len(authorized_users)}</b>",
+        f"Активных MAX клиентов: <b>{session_manager.active_client_count()}</b>",
+        f"Активных auth-flow: <b>{session_manager.active_auth_flow_count()}</b>",
+        f"Открытых чатов с автообновлением: <b>{len(ACTIVE_CHAT_VIEWS)}</b>",
+        f"Очередь отправки: <b>{pending_queue}</b> (пользователей: {len(queue_users)})",
+        f"Latency отправки: <b>{esc(latency_line)}</b>",
+        f"Updates loop: <b>{'OK' if UPDATE_TASK and not UPDATE_TASK.done() else 'DOWN'}</b>",
+        f"Chat refresh loop: <b>{'OK' if CHAT_REFRESH_TASK and not CHAT_REFRESH_TASK.done() else 'DOWN'}</b>",
+        f"Queue loop: <b>{'OK' if QUEUE_TASK and not QUEUE_TASK.done() else 'DOWN'}</b>",
+    ]
+    return "\n".join(lines)
+
+
+def render_stats_text() -> str:
+    latencies = list(METRICS.latencies_ms)
+    if latencies:
+        avg_latency = sum(latencies) / len(latencies)
+        p95_latency = percentile(latencies, 0.95)
+    else:
+        avg_latency = 0.0
+        p95_latency = 0.0
+
+    lines = [
+        "<b>Stats</b>",
+        f"Direct sent: <b>{METRICS.direct_sent}</b>",
+        f"Queued (enqueued): <b>{METRICS.queued_messages}</b>",
+        f"Queued (delivered): <b>{METRICS.queue_sent}</b>",
+        f"Send failures: <b>{METRICS.send_failures}</b>",
+        f"Update notifications: <b>{METRICS.update_notifications}</b>",
+        f"Pending queue now: <b>{session_manager.count_pending_outgoing()}</b>",
+        f"Unread now: <b>{sum(UNREAD_COUNTS.values())}</b>",
+        f"Latency avg/p95: <b>{avg_latency:.0f}ms / {p95_latency:.0f}ms</b>",
+    ]
+
+    recent = list(METRICS.send_errors)[-8:]
+    if recent:
+        lines.append("")
+        lines.append("<b>Последние ошибки отправки:</b>")
+        for event in recent:
+            stamp = datetime.fromtimestamp(event.at).strftime("%H:%M:%S")
+            lines.append(
+                f"• <code>{esc(stamp)}</code> [{esc(event.source)}] "
+                f"u{event.tg_user_id} c{event.chat_id}: {esc(event.error)}"
+            )
+    return "\n".join(lines)
+
+
+def render_admin_users_text() -> str:
+    authorized = sorted(session_manager.get_authorized_user_ids())
+    queued = sorted(session_manager.get_outgoing_user_ids())
+    authorized_set = set(authorized)
+    queued_set = set(queued)
+    all_ids = sorted(authorized_set | queued_set)
+
+    lines = [
+        "<b>👥 Пользователи</b>",
+        f"С токеном MAX: <b>{len(authorized)}</b>",
+        f"С очередью отправки: <b>{len(queued)}</b>",
+    ]
+
+    if not all_ids:
+        lines.append("")
+        lines.append("<i>Пока нет пользователей для отображения.</i>")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("<b>Список (до 25):</b>")
+    for user_id in all_ids[:25]:
+        badges: list[str] = []
+        if user_id in authorized_set:
+            badges.append("MAX")
+        if user_id in queued_set:
+            badges.append(f"Q:{session_manager.count_pending_outgoing(user_id)}")
+        badge_text = ", ".join(badges) if badges else "—"
+        lines.append(f"• <code>{user_id}</code> [{esc(badge_text)}]")
+
+    extra = len(all_ids) - 25
+    if extra > 0:
+        lines.append(f"… и еще <b>{extra}</b> пользователей")
+    return "\n".join(lines)
+
+
+def render_admin_queue_text() -> str:
+    pending_total = session_manager.count_pending_outgoing()
+    queue_users = sorted(session_manager.get_outgoing_user_ids())
+
+    lines = [
+        "<b>📥 Очередь отправки</b>",
+        f"Всего сообщений в очереди: <b>{pending_total}</b>",
+        f"Пользователей с очередью: <b>{len(queue_users)}</b>",
+    ]
+
+    if not queue_users:
+        lines.append("")
+        lines.append("<i>Очередь пуста.</i>")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("<b>Нагрузка по пользователям:</b>")
+    for user_id in queue_users[:30]:
+        count = session_manager.count_pending_outgoing(user_id)
+        lines.append(f"• <code>{user_id}</code>: <b>{count}</b>")
+
+    extra = len(queue_users) - 30
+    if extra > 0:
+        lines.append(f"… и еще <b>{extra}</b> пользователей")
+    return "\n".join(lines)
+
+
+def render_admin_panel_text() -> str:
+    uptime = format_duration(int(time.time() - METRICS.started_at))
+    lines = [
+        "<b>🛠 Админ-панель Tg2max</b>",
+        f"Uptime: <code>{esc(uptime)}</code>",
+        f"Авторизовано пользователей: <b>{len(session_manager.get_authorized_user_ids())}</b>",
+        f"Активных MAX клиентов: <b>{session_manager.active_client_count()}</b>",
+        f"Очередь отправки: <b>{session_manager.count_pending_outgoing()}</b>",
+        f"Непрочитанные (в RAM): <b>{sum(UNREAD_COUNTS.values())}</b>",
+        "",
+        f"Updates loop: <b>{'OK' if UPDATE_TASK and not UPDATE_TASK.done() else 'DOWN'}</b>",
+        f"Chat refresh loop: <b>{'OK' if CHAT_REFRESH_TASK and not CHAT_REFRESH_TASK.done() else 'DOWN'}</b>",
+        f"Queue loop: <b>{'OK' if QUEUE_TASK and not QUEUE_TASK.done() else 'DOWN'}</b>",
+        "",
+        "Выбери раздел ниже.",
+    ]
+    return "\n".join(lines)
+
+
 def auth_menu_text(has_token: bool) -> str:
     status = "подключен ✅" if has_token else "не подключен ❌"
     return (
@@ -2679,34 +2849,7 @@ async def cmd_health(message: types.Message) -> None:
     remember_user(message.from_user)
     if not is_admin_user(message.from_user.id):
         return
-
-    uptime = format_duration(int(time.time() - METRICS.started_at))
-    authorized_users = session_manager.get_authorized_user_ids()
-    pending_queue = session_manager.count_pending_outgoing()
-    queue_users = session_manager.get_outgoing_user_ids()
-    latencies = list(METRICS.latencies_ms)
-
-    if latencies:
-        avg_latency = sum(latencies) / len(latencies)
-        p95_latency = percentile(latencies, 0.95)
-        latency_line = f"{avg_latency:.0f}ms avg / {p95_latency:.0f}ms p95"
-    else:
-        latency_line = "нет данных"
-
-    lines = [
-        "<b>Health</b>",
-        f"Uptime: <code>{esc(uptime)}</code>",
-        f"Авторизовано пользователей: <b>{len(authorized_users)}</b>",
-        f"Активных MAX клиентов: <b>{session_manager.active_client_count()}</b>",
-        f"Активных auth-flow: <b>{session_manager.active_auth_flow_count()}</b>",
-        f"Открытых чатов с автообновлением: <b>{len(ACTIVE_CHAT_VIEWS)}</b>",
-        f"Очередь отправки: <b>{pending_queue}</b> (пользователей: {len(queue_users)})",
-        f"Latency отправки: <b>{esc(latency_line)}</b>",
-        f"Updates loop: <b>{'OK' if UPDATE_TASK and not UPDATE_TASK.done() else 'DOWN'}</b>",
-        f"Chat refresh loop: <b>{'OK' if CHAT_REFRESH_TASK and not CHAT_REFRESH_TASK.done() else 'DOWN'}</b>",
-        f"Queue loop: <b>{'OK' if QUEUE_TASK and not QUEUE_TASK.done() else 'DOWN'}</b>",
-    ]
-    await message.answer("\n".join(lines))
+    await message.answer(render_health_text())
 
 
 @dp.message(Command("stats"))
@@ -2714,38 +2857,22 @@ async def cmd_stats(message: types.Message) -> None:
     remember_user(message.from_user)
     if not is_admin_user(message.from_user.id):
         return
+    await message.answer(render_stats_text())
 
-    latencies = list(METRICS.latencies_ms)
-    if latencies:
-        avg_latency = sum(latencies) / len(latencies)
-        p95_latency = percentile(latencies, 0.95)
-    else:
-        avg_latency = 0.0
-        p95_latency = 0.0
 
-    lines = [
-        "<b>Stats</b>",
-        f"Direct sent: <b>{METRICS.direct_sent}</b>",
-        f"Queued (enqueued): <b>{METRICS.queued_messages}</b>",
-        f"Queued (delivered): <b>{METRICS.queue_sent}</b>",
-        f"Send failures: <b>{METRICS.send_failures}</b>",
-        f"Update notifications: <b>{METRICS.update_notifications}</b>",
-        f"Pending queue now: <b>{session_manager.count_pending_outgoing()}</b>",
-        f"Unread now: <b>{sum(UNREAD_COUNTS.values())}</b>",
-        f"Latency avg/p95: <b>{avg_latency:.0f}ms / {p95_latency:.0f}ms</b>",
-    ]
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message) -> None:
+    remember_user(message.from_user)
+    with contextlib.suppress(Exception):
+        await message.delete()
+    if not is_admin_user(message.from_user.id):
+        return
 
-    recent = list(METRICS.send_errors)[-8:]
-    if recent:
-        lines.append("")
-        lines.append("<b>Последние ошибки отправки:</b>")
-        for event in recent:
-            stamp = datetime.fromtimestamp(event.at).strftime("%H:%M:%S")
-            lines.append(
-                f"• <code>{esc(stamp)}</code> [{esc(event.source)}] "
-                f"u{event.tg_user_id} c{event.chat_id}: {esc(event.error)}"
-            )
-    await message.answer("\n".join(lines))
+    clear_active_chat_view(message.from_user.id)
+    await message.answer(
+        render_admin_panel_text(),
+        reply_markup=admin_panel_keyboard(),
+    )
 
 
 @dp.callback_query(F.data == "menu:main")
@@ -3129,6 +3256,44 @@ async def cb_msg_close(callback: types.CallbackQuery) -> None:
         await callback.message.delete()
     except Exception:
         pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:"))
+async def cb_admin_panel(callback: types.CallbackQuery) -> None:
+    if callback.from_user:
+        remember_user(callback.from_user)
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    parts = (callback.data or "").split(":")
+    if len(parts) != 2:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    clear_active_chat_view(callback.from_user.id)
+    action = parts[1]
+    if action == "panel":
+        text = render_admin_panel_text()
+        keyboard = admin_panel_keyboard()
+    elif action == "health":
+        text = render_health_text()
+        keyboard = admin_back_keyboard()
+    elif action == "stats":
+        text = render_stats_text()
+        keyboard = admin_back_keyboard()
+    elif action == "users":
+        text = render_admin_users_text()
+        keyboard = admin_back_keyboard()
+    elif action == "queue":
+        text = render_admin_queue_text()
+        keyboard = admin_back_keyboard()
+    else:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    await safe_edit_message(callback.message, text, keyboard)
     await callback.answer()
 
 

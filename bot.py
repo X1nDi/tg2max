@@ -2845,6 +2845,8 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
     name = " ".join(
         part for part in [message.from_user.first_name, message.from_user.last_name] if part
     ).strip() or "друг"
+    with contextlib.suppress(Exception):
+        await message.delete()
     await send_main_menu_message(message.chat.id, has_token, name)
 
 
@@ -2858,6 +2860,8 @@ async def cmd_menu(message: types.Message, state: FSMContext) -> None:
     name = " ".join(
         part for part in [message.from_user.first_name, message.from_user.last_name] if part
     ).strip() or "друг"
+    with contextlib.suppress(Exception):
+        await message.delete()
     await send_main_menu_message(message.chat.id, has_token, name)
 
 
@@ -2868,6 +2872,8 @@ async def cmd_login(message: types.Message, state: FSMContext) -> None:
     await state.clear()
     clear_active_chat_view(message.from_user.id)
     has_token = session_manager.has_token(message.from_user.id)
+    with contextlib.suppress(Exception):
+        await message.delete()
     await message.answer(auth_menu_text(has_token), reply_markup=auth_methods_keyboard(has_token))
 
 
@@ -2881,6 +2887,8 @@ async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
     name = " ".join(
         part for part in [message.from_user.first_name, message.from_user.last_name] if part
     ).strip() or "друг"
+    with contextlib.suppress(Exception):
+        await message.delete()
     await send_main_menu_message(message.chat.id, has_token, name)
 
 
@@ -4195,6 +4203,8 @@ async def fallback_text(message: types.Message, state: FSMContext) -> None:
     name = " ".join(
         part for part in [message.from_user.first_name, message.from_user.last_name] if part
     ).strip() or "друг"
+    with contextlib.suppress(Exception):
+        await message.delete()
     await send_main_menu_message(message.chat.id, has_token, name)
 
 

@@ -3330,7 +3330,7 @@ async def cb_notify_read(callback: types.CallbackQuery) -> None:
         return
 
     chat_id = parse_int(parts[2], default=0)
-    if chat_id <= 0:
+    if chat_id == 0:
         await callback.answer("Чат не найден", show_alert=True)
         return
 
@@ -3351,7 +3351,7 @@ async def cb_notify_open(callback: types.CallbackQuery) -> None:
         return
 
     chat_id = parse_int(parts[2], default=0)
-    if chat_id <= 0:
+    if chat_id == 0:
         await callback.answer("Чат не найден", show_alert=True)
         return
 
@@ -3639,7 +3639,7 @@ async def cb_chat_auto_refresh(callback: types.CallbackQuery) -> None:
     action = parts[1]
     chat_id = parse_int(parts[2], default=0)
     chat_page = max(0, parse_int(parts[3], default=0))
-    if chat_id <= 0 or action not in {"pause", "resume"}:
+    if chat_id == 0 or action not in {"pause", "resume"}:
         await callback.answer("Некорректные данные", show_alert=True)
         return
 
